@@ -19,12 +19,12 @@ type BaseStats struct {
 
 // PokedexEntry holds the data we need from each Pokemon
 type PokedexEntry struct {
-	Name        string            `json:"name"`
-	Types       []string          `json:"types"`
-	BaseStats   BaseStats         `json:"baseStats"`
-	Abilities   map[string]string `json:"abilities"`
+	Name        string             `json:"name"`
+	Types       []string           `json:"types"`
+	BaseStats   BaseStats          `json:"baseStats"`
+	Abilities   map[string]string  `json:"abilities"`
 	GenderRatio map[string]float64 `json:"genderRatio"`
-	Weight      float64           `json:"weightkg"`
+	Weight      float64            `json:"weightkg"`
 }
 
 // Pokedex is the global lookup map: normalized name -> entry
@@ -33,15 +33,7 @@ var Pokedex map[string]*PokedexEntry
 // normalizeName converts a species name to the Showdown key format:
 // lowercase, strip spaces, hyphens, dots, apostrophes, colons
 func normalizeName(name string) string {
-	s := strings.ToLower(name)
-	s = strings.ReplaceAll(s, " ", "")
-	s = strings.ReplaceAll(s, "-", "")
-	s = strings.ReplaceAll(s, ".", "")
-	s = strings.ReplaceAll(s, "'", "")
-	s = strings.ReplaceAll(s, "'", "")
-	s = strings.ReplaceAll(s, ":", "")
-	s = strings.ReplaceAll(s, "%", "")
-	return s
+	return NormalizeID(name)
 }
 
 // LoadPokedex parses the pokedex.json file into the global Pokedex map
@@ -93,7 +85,7 @@ func LookupSpecies(species string) *PokedexEntry {
 	}
 
 	// Try direct normalized lookup
-	key := normalizeName(species)
+	key := NormalizeID(species)
 	if entry, ok := Pokedex[key]; ok {
 		return entry
 	}

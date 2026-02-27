@@ -50,9 +50,10 @@ func GenerateRandomPlayerState(playerID string) PlayerState {
 // NewRandomBattleState creates a completely automated game state seeded with random Pokemon.
 func NewRandomBattleState() *BattleState {
 	state := &BattleState{
-		Turn: 0,
-		P1:   GenerateRandomPlayerState("p1"),
-		P2:   GenerateRandomPlayerState("p2"),
+		Turn:     0,
+		P1:       GenerateRandomPlayerState("p1"),
+		P2:       GenerateRandomPlayerState("p2"),
+		RNGState: rand.Uint64(),
 	}
 
 	// Make the first slot active

@@ -558,7 +558,9 @@ func vectorizePlayerFeatures(player *simulator.PlayerState, state *simulator.Bat
 		if !active.Fainted {
 			aliveCount += 1.0
 		}
-		totalHP += float64(active.HP) / 100.0
+		if active.MaxHP > 0 {
+			totalHP += float64(active.HP) / float64(active.MaxHP)
+		}
 	}
 
 	// 2. SORT REMAINING TEAM BY NAME FOR CONSISTENCY
@@ -581,7 +583,9 @@ func vectorizePlayerFeatures(player *simulator.PlayerState, state *simulator.Bat
 		if !poke.Fainted {
 			aliveCount += 1.0
 		}
-		totalHP += float64(poke.HP) / 100.0
+		if poke.MaxHP > 0 {
+			totalHP += float64(poke.HP) / float64(poke.MaxHP)
+		}
 		slotsAdded++
 	}
 
@@ -613,7 +617,15 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 		isActive = 1.0
 	}
 
-	hpPct := float64(poke.HP) / 100.0
+	hpPct := 0.0
+	if poke.MaxHP > 0 {
+		hpPct = float64(poke.HP) / float64(poke.MaxHP)
+		if hpPct < 0 {
+			hpPct = 0
+		} else if hpPct > 1 {
+			hpPct = 1
+		}
+	}
 
 	brn, par, slp, psn := 0.0, 0.0, 0.0, 0.0
 	switch poke.Status {
@@ -796,8 +808,11 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 
 			// 4. Accuracy (1)
 			acc := 1.0
-			if val, ok := move.Accuracy.(int); ok {
+			switch val := move.Accuracy.(type) {
+			case int:
 				acc = float64(val) / 100.0
+			case float64:
+				acc = val / 100.0
 			}
 			slots[*slotsIdx] = acc
 			*slotsIdx++

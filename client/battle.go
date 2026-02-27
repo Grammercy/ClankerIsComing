@@ -26,7 +26,7 @@ func normalizeTypeName(typeName string) string {
 func ParseCondition(cond string) (int, int, bool) {
 	cond = strings.TrimSpace(cond)
 	if cond == "0 fnt" {
-		return 0, 0, true
+		return 0, 100, true
 	}
 
 	// Strip status like " par", " brn", etc.
@@ -37,10 +37,6 @@ func ParseCondition(cond string) (int, int, bool) {
 	if len(hpParts) == 2 {
 		current, _ := strconv.Atoi(hpParts[0])
 		max, _ := strconv.Atoi(hpParts[1])
-		if max > 0 {
-			normalized := (current * 100) / max
-			return normalized, 100, current <= 0
-		}
 		return current, max, current <= 0
 	}
 
@@ -83,12 +79,14 @@ func ParseDetails(details string) (string, int, string) {
 // be filled with minimal defaults unless provided.
 func RequestToBattleState(req *ShowdownRequest, currentBattleState *simulator.BattleState) *simulator.BattleState {
 	state := &simulator.BattleState{
-		Turn: 1,
+		Turn:     1,
+		RNGState: uint64(time.Now().UnixNano()),
 	}
 
 	if currentBattleState != nil {
 		state.Field = currentBattleState.Field
 		state.Turn = currentBattleState.Turn
+		state.RNGState = currentBattleState.RNGState
 	}
 
 	// Build our side
@@ -160,7 +158,7 @@ func RequestToBattleState(req *ShowdownRequest, currentBattleState *simulator.Ba
 				HP:       100,
 				MaxHP:    100,
 				IsActive: (i == 0),
-				Boosts:   114420174,
+				Boosts:   simulator.NeutralBoosts,
 			}
 		}
 	}
@@ -202,7 +200,7 @@ func buildPlayerState(pokemon []ShowdownPokemon, playerID string, currentPlayer 
 			IsActive:      poke.Active,
 			Fainted:       fainted,
 			Terastallized: poke.Terastallized != "",
-			Boosts:        114420174,
+			Boosts:        simulator.NeutralBoosts,
 			Level:         level,
 			Gender:        gender,
 			Ability:       poke.Ability,
@@ -297,8 +295,8 @@ func printPlayer(roomID, label string, p *simulator.PlayerState) {
 		if poke.Fainted {
 			faintStr = "[FAINTED]"
 		}
-		log.Printf("[%s]   [%d] %s %d/100 %s %s Volatiles=%0x",
-			roomID, i, poke.Species, poke.HP, activeStr, faintStr, poke.Volatiles)
+		log.Printf("[%s]   [%d] %s %d/%d %s %s Volatiles=%0x",
+			roomID, i, poke.Species, poke.HP, poke.MaxHP, activeStr, faintStr, poke.Volatiles)
 	}
 }
 
