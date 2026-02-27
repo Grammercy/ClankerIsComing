@@ -132,24 +132,42 @@ func init() {
 // This uses a switch statement for performance, avoiding map lookups.
 func GetTypeIndex(t string) int {
 	switch t {
-	case "Normal": return 0
-	case "Fire": return 1
-	case "Water": return 2
-	case "Electric": return 3
-	case "Grass": return 4
-	case "Ice": return 5
-	case "Fighting": return 6
-	case "Poison": return 7
-	case "Ground": return 8
-	case "Flying": return 9
-	case "Psychic": return 10
-	case "Bug": return 11
-	case "Rock": return 12
-	case "Ghost": return 13
-	case "Dragon": return 14
-	case "Dark": return 15
-	case "Steel": return 16
-	case "Fairy": return 17
+	case "Normal":
+		return 0
+	case "Fire":
+		return 1
+	case "Water":
+		return 2
+	case "Electric":
+		return 3
+	case "Grass":
+		return 4
+	case "Ice":
+		return 5
+	case "Fighting":
+		return 6
+	case "Poison":
+		return 7
+	case "Ground":
+		return 8
+	case "Flying":
+		return 9
+	case "Psychic":
+		return 10
+	case "Bug":
+		return 11
+	case "Rock":
+		return 12
+	case "Ghost":
+		return 13
+	case "Dragon":
+		return 14
+	case "Dark":
+		return 15
+	case "Steel":
+		return 16
+	case "Fairy":
+		return 17
 	}
 	return -1
 }
@@ -173,8 +191,8 @@ func CalcTypeEffectiveness(attackType string, defenderTypes []string) float64 {
 }
 
 // TypeOneHot returns an 18-element slice with 1.0 for each matching type
-func TypeOneHot(types []string) []float64 {
-	vec := make([]float64, 18)
+func TypeOneHot(types []string) [18]float64 {
+	var vec [18]float64
 	for _, t := range types {
 		idx := GetTypeIndex(t)
 		if idx != -1 {
