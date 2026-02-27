@@ -19,6 +19,9 @@ var TypeIndex map[string]int
 // 0.0 = immune, 0.5 = not very effective, 1.0 = neutral, 2.0 = super effective
 var TypeChart map[string]map[string]float64
 
+// typeChartMatrix provides O(1) lookup for type effectiveness
+var typeChartMatrix [18][18]float64
+
 func init() {
 	// Build type index
 	TypeIndex = make(map[string]int, len(AllTypes))
@@ -101,22 +104,70 @@ func init() {
 			"Dark": 2.0, "Steel": 0.5,
 		},
 	}
+
+	// Initialize matrix with 1.0 (neutral)
+	for i := 0; i < 18; i++ {
+		for j := 0; j < 18; j++ {
+			typeChartMatrix[i][j] = 1.0
+		}
+	}
+
+	// Populate matrix from map
+	for atk, defs := range TypeChart {
+		atkIdx := GetTypeIndex(atk)
+		if atkIdx == -1 {
+			continue
+		}
+		for def, multiplier := range defs {
+			defIdx := GetTypeIndex(def)
+			if defIdx == -1 {
+				continue
+			}
+			typeChartMatrix[atkIdx][defIdx] = multiplier
+		}
+	}
+}
+
+// GetTypeIndex returns the index of a type in AllTypes, or -1 if not found.
+// This uses a switch statement for performance, avoiding map lookups.
+func GetTypeIndex(t string) int {
+	switch t {
+	case "Normal": return 0
+	case "Fire": return 1
+	case "Water": return 2
+	case "Electric": return 3
+	case "Grass": return 4
+	case "Ice": return 5
+	case "Fighting": return 6
+	case "Poison": return 7
+	case "Ground": return 8
+	case "Flying": return 9
+	case "Psychic": return 10
+	case "Bug": return 11
+	case "Rock": return 12
+	case "Ghost": return 13
+	case "Dragon": return 14
+	case "Dark": return 15
+	case "Steel": return 16
+	case "Fairy": return 17
+	}
+	return -1
 }
 
 // CalcTypeEffectiveness returns the multiplier for an attack type vs a defending Pokemon's types.
 // For dual-typed defenders, multipliers are multiplied together (e.g., 2.0 * 2.0 = 4.0).
 func CalcTypeEffectiveness(attackType string, defenderTypes []string) float64 {
-	multiplier := 1.0
-	attackMap, exists := TypeChart[attackType]
-	if !exists {
+	atkIdx := GetTypeIndex(attackType)
+	if atkIdx == -1 {
 		return 1.0 // Unknown type, assume neutral
 	}
 
+	multiplier := 1.0
 	for _, defType := range defenderTypes {
-		if eff, ok := attackMap[defType]; ok {
-			multiplier *= eff
+		defIdx := GetTypeIndex(defType)
+		if defIdx != -1 {
+			multiplier *= typeChartMatrix[atkIdx][defIdx]
 		}
-		// If not in the map, it's 1.0 (neutral), so no change
 	}
 	return multiplier
 }
@@ -125,7 +176,8 @@ func CalcTypeEffectiveness(attackType string, defenderTypes []string) float64 {
 func TypeOneHot(types []string) []float64 {
 	vec := make([]float64, 18)
 	for _, t := range types {
-		if idx, ok := TypeIndex[t]; ok {
+		idx := GetTypeIndex(t)
+		if idx != -1 {
 			vec[idx] = 1.0
 		}
 	}
