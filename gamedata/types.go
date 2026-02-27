@@ -12,120 +12,45 @@ var AllTypes = []string{
 	"Rock", "Ghost", "Dragon", "Dark", "Steel", "Fairy",
 }
 
-// TypeIndex maps type name -> index in AllTypes for fast lookup
-var TypeIndex map[string]int
-
-// TypeChart holds the effectiveness multiplier: TypeChart[attacker][defender] = multiplier
-// 0.0 = immune, 0.5 = not very effective, 1.0 = neutral, 2.0 = super effective
-var TypeChart map[string]map[string]float64
-
 // typeChartMatrix provides O(1) lookup for type effectiveness
-var typeChartMatrix [18][18]float64
-
-func init() {
-	// Build type index
-	TypeIndex = make(map[string]int, len(AllTypes))
-	for i, t := range AllTypes {
-		TypeIndex[t] = i
-	}
-
-	// Build the full 18x18 type effectiveness chart (Gen 6+ with Fairy)
-	TypeChart = map[string]map[string]float64{
-		"Normal": {
-			"Rock": 0.5, "Ghost": 0.0, "Steel": 0.5,
-		},
-		"Fire": {
-			"Fire": 0.5, "Water": 0.5, "Grass": 2.0, "Ice": 2.0,
-			"Bug": 2.0, "Rock": 0.5, "Dragon": 0.5, "Steel": 2.0,
-		},
-		"Water": {
-			"Fire": 2.0, "Water": 0.5, "Grass": 0.5, "Ground": 2.0,
-			"Rock": 2.0, "Dragon": 0.5,
-		},
-		"Electric": {
-			"Water": 2.0, "Electric": 0.5, "Grass": 0.5, "Ground": 0.0,
-			"Flying": 2.0, "Dragon": 0.5,
-		},
-		"Grass": {
-			"Fire": 0.5, "Water": 2.0, "Grass": 0.5, "Poison": 0.5,
-			"Ground": 2.0, "Flying": 0.5, "Bug": 0.5, "Rock": 2.0,
-			"Dragon": 0.5, "Steel": 0.5,
-		},
-		"Ice": {
-			"Fire": 0.5, "Water": 0.5, "Grass": 2.0, "Ice": 0.5,
-			"Ground": 2.0, "Flying": 2.0, "Dragon": 2.0, "Steel": 0.5,
-		},
-		"Fighting": {
-			"Normal": 2.0, "Ice": 2.0, "Poison": 0.5, "Flying": 0.5,
-			"Psychic": 0.5, "Bug": 0.5, "Rock": 2.0, "Ghost": 0.0,
-			"Dark": 2.0, "Steel": 2.0, "Fairy": 0.5,
-		},
-		"Poison": {
-			"Grass": 2.0, "Poison": 0.5, "Ground": 0.5, "Rock": 0.5,
-			"Ghost": 0.5, "Steel": 0.0, "Fairy": 2.0,
-		},
-		"Ground": {
-			"Fire": 2.0, "Electric": 2.0, "Grass": 0.5, "Poison": 2.0,
-			"Flying": 0.0, "Bug": 0.5, "Rock": 2.0, "Steel": 2.0,
-		},
-		"Flying": {
-			"Electric": 0.5, "Grass": 2.0, "Fighting": 2.0, "Bug": 2.0,
-			"Rock": 0.5, "Steel": 0.5,
-		},
-		"Psychic": {
-			"Fighting": 2.0, "Poison": 2.0, "Psychic": 0.5, "Dark": 0.0,
-			"Steel": 0.5,
-		},
-		"Bug": {
-			"Fire": 0.5, "Grass": 2.0, "Fighting": 0.5, "Poison": 0.5,
-			"Flying": 0.5, "Psychic": 2.0, "Ghost": 0.5, "Dark": 2.0,
-			"Steel": 0.5, "Fairy": 0.5,
-		},
-		"Rock": {
-			"Fire": 2.0, "Ice": 2.0, "Fighting": 0.5, "Ground": 0.5,
-			"Flying": 2.0, "Bug": 2.0, "Steel": 0.5,
-		},
-		"Ghost": {
-			"Normal": 0.0, "Psychic": 2.0, "Ghost": 2.0, "Dark": 0.5,
-		},
-		"Dragon": {
-			"Dragon": 2.0, "Steel": 0.5, "Fairy": 0.0,
-		},
-		"Dark": {
-			"Fighting": 0.5, "Psychic": 2.0, "Ghost": 2.0, "Dark": 0.5,
-			"Fairy": 0.5,
-		},
-		"Steel": {
-			"Fire": 0.5, "Water": 0.5, "Electric": 0.5, "Ice": 2.0,
-			"Rock": 2.0, "Steel": 0.5, "Fairy": 2.0,
-		},
-		"Fairy": {
-			"Fire": 0.5, "Fighting": 2.0, "Poison": 0.5, "Dragon": 2.0,
-			"Dark": 2.0, "Steel": 0.5,
-		},
-	}
-
-	// Initialize matrix with 1.0 (neutral)
-	for i := 0; i < 18; i++ {
-		for j := 0; j < 18; j++ {
-			typeChartMatrix[i][j] = 1.0
-		}
-	}
-
-	// Populate matrix from map
-	for atk, defs := range TypeChart {
-		atkIdx := GetTypeIndex(atk)
-		if atkIdx == -1 {
-			continue
-		}
-		for def, multiplier := range defs {
-			defIdx := GetTypeIndex(def)
-			if defIdx == -1 {
-				continue
-			}
-			typeChartMatrix[atkIdx][defIdx] = multiplier
-		}
-	}
+// Rows represent attackers, columns represent defenders.
+var typeChartMatrix = [18][18]float64{
+	// Normal
+	{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.0, 1.0, 1.0, 0.5, 1.0},
+	// Fire
+	{1.0, 0.5, 0.5, 1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0},
+	// Water
+	{1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5, 1.0, 1.0, 1.0},
+	// Electric
+	{1.0, 1.0, 2.0, 0.5, 0.5, 1.0, 1.0, 1.0, 0.0, 2.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0},
+	// Grass
+	{1.0, 0.5, 2.0, 1.0, 0.5, 1.0, 1.0, 0.5, 2.0, 0.5, 1.0, 0.5, 2.0, 1.0, 0.5, 1.0, 0.5, 1.0},
+	// Ice
+	{1.0, 0.5, 0.5, 1.0, 2.0, 0.5, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5, 1.0},
+	// Fighting
+	{2.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5, 1.0, 0.5, 0.5, 0.5, 2.0, 0.0, 1.0, 2.0, 2.0, 0.5},
+	// Poison
+	{1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, 0.5, 0.5, 1.0, 1.0, 0.0, 2.0},
+	// Ground
+	{1.0, 2.0, 1.0, 2.0, 0.5, 1.0, 1.0, 2.0, 1.0, 0.0, 1.0, 0.5, 2.0, 1.0, 1.0, 1.0, 2.0, 1.0},
+	// Flying
+	{1.0, 1.0, 1.0, 0.5, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 2.0, 0.5, 1.0, 1.0, 1.0, 0.5, 1.0},
+	// Psychic
+	{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5, 1.0},
+	// Bug
+	{1.0, 0.5, 1.0, 1.0, 2.0, 1.0, 0.5, 0.5, 1.0, 0.5, 2.0, 1.0, 1.0, 0.5, 1.0, 2.0, 0.5, 0.5},
+	// Rock
+	{1.0, 2.0, 1.0, 1.0, 1.0, 2.0, 0.5, 1.0, 0.5, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0},
+	// Ghost
+	{0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 0.5, 1.0, 1.0},
+	// Dragon
+	{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5, 0.0},
+	// Dark
+	{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 0.5, 1.0, 0.5},
+	// Steel
+	{1.0, 0.5, 0.5, 0.5, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 0.5, 2.0},
+	// Fairy
+	{1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 2.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 0.5, 1.0},
 }
 
 // GetTypeIndex returns the index of a type in AllTypes, or -1 if not found.
