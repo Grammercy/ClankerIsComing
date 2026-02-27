@@ -894,12 +894,22 @@ func runMixedTrainCommand(inDir string, taggedDir string, testDir string, search
 		tt := evaluator.NewTranspositionTable()
 		taggedSamples := make([]evaluator.TaggedSample, 0, len(indices))
 
+		if len(indices) == 0 {
+			continue
+		}
+		state, err := simulator.FastForwardToEvent(replay, indices[0]-1)
+		if err != nil {
+			skippedPositions += len(indices)
+			continue
+		}
+		lastEventIdx := indices[0] - 1
+
 		for _, eventIdx := range indices {
-			state, err := simulator.FastForwardToEvent(replay, eventIdx-1)
-			if err != nil {
-				skippedPositions++
-				continue
+			for i := lastEventIdx + 1; i < eventIdx; i++ {
+				simulator.ApplyEvent(state, replay.Events[i])
 			}
+			simulator.UpdateRNGState(state, replay, eventIdx-1)
+			lastEventIdx = eventIdx - 1
 
 			validActions, validLen := simulator.GetSearchActions(&state.P1)
 			if validLen == 0 {
@@ -1097,12 +1107,22 @@ func runTagReplaysCommand(inDir string, taggedDir string, searchDepth int) error
 		tt := evaluator.NewTranspositionTable()
 		taggedSamples := make([]evaluator.TaggedSample, 0, len(indices))
 
+		if len(indices) == 0 {
+			continue
+		}
+		state, err := simulator.FastForwardToEvent(replay, indices[0]-1)
+		if err != nil {
+			skippedPositions += len(indices)
+			continue
+		}
+		lastEventIdx := indices[0] - 1
+
 		for _, eventIdx := range indices {
-			state, err := simulator.FastForwardToEvent(replay, eventIdx-1)
-			if err != nil {
-				skippedPositions++
-				continue
+			for i := lastEventIdx + 1; i < eventIdx; i++ {
+				simulator.ApplyEvent(state, replay.Events[i])
 			}
+			simulator.UpdateRNGState(state, replay, eventIdx-1)
+			lastEventIdx = eventIdx - 1
 
 			validActions, validLen := simulator.GetSearchActions(&state.P1)
 			if validLen == 0 {
