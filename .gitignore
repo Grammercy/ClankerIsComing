@@ -1,0 +1,10 @@
+
+data/
+
+# Large model/checkpoint artifacts
+attention_weights.json
+evaluator_weights.json
+
+# Built binaries
+pokemon-engine.exe
+*.exe
