@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
@@ -38,6 +39,8 @@ const (
 	AccShift  uint32 = 24
 	BoostMask uint32 = 0xF
 )
+
+const NeutralBoosts uint32 = (6 << AtkShift) | (6 << DefShift) | (6 << SpaShift) | (6 << SpdShift) | (6 << SpeShift) | (6 << EvaShift) | (6 << AccShift)
 
 const (
 	VolatileSubstitute  uint32 = 1 << 0
@@ -130,42 +133,42 @@ func (p *PokemonState) ToggleVolatile(bit uint32, active bool) {
 }
 
 func MapVolatileToBit(v string) uint32 {
-	switch v {
-	case "Substitute":
+	switch gamedata.NormalizeID(v) {
+	case "substitute":
 		return VolatileSubstitute
 	case "confusion":
 		return VolatileConfusion
-	case "Encore":
+	case "encore":
 		return VolatileEncore
-	case "Taunt":
+	case "taunt":
 		return VolatileTaunt
-	case "Leech Seed":
+	case "leechseed":
 		return VolatileLeechSeed
-	case "Perish Song":
+	case "perishsong":
 		return VolatilePerishSong
-	case "Attract":
+	case "attract":
 		return VolatileAttract
-	case "Focus Energy":
+	case "focusenergy":
 		return VolatileFocusEnergy
-	case "Destiny Bond":
+	case "destinybond":
 		return VolatileDestinyBond
-	case "Magnet Rise":
+	case "magnetrise":
 		return VolatileMagnetRise
-	case "Telekinesis":
+	case "telekinesis":
 		return VolatileTelekinesis
-	case "Gastro Acid":
+	case "gastroacid":
 		return VolatileGastroAcid
-	case "Ingrain":
+	case "ingrain":
 		return VolatileIngrain
-	case "Aqua Ring":
+	case "aquaring":
 		return VolatileAquaRing
-	case "Curse":
+	case "curse":
 		return VolatileCurse
-	case "Embargo":
+	case "embargo":
 		return VolatileEmbargo
-	case "Heal Block":
+	case "healblock":
 		return VolatileHealBlock
-	case "Protect", "Endure", "Spiky Shield", "Baneful Bunker", "King's Shield", "Silk Trap", "Obstruct", "Burning Bulwark":
+	case "protect", "endure", "spikyshield", "banefulbunker", "kingsshield", "silktrap", "obstruct", "burningbulwark":
 		return VolatileProtection
 	}
 	return 0
@@ -214,16 +217,65 @@ func (p *PlayerState) GetActive() *PokemonState {
 
 // BattleState tracks the full simulation up to the current turn
 type BattleState struct {
-	Turn  int
-	P1    PlayerState
-	P2    PlayerState
-	Field FieldConditions
+	Turn     int
+	P1       PlayerState
+	P2       PlayerState
+	Field    FieldConditions
+	RNGState uint64
 }
 
 // Action represents a possible move or switch
 type Action struct {
 	Type string // "move" or "switch"
 	Name string // The move name or the Pokemon to switch to
+}
+
+func seedHash(parts ...string) uint64 {
+	var h uint64 = 1469598103934665603
+	for _, part := range parts {
+		for i := 0; i < len(part); i++ {
+			h ^= uint64(part[i])
+			h *= 1099511628211
+		}
+		h ^= 0xff
+		h *= 1099511628211
+	}
+	if h == 0 {
+		return 0x9e3779b97f4a7c15
+	}
+	return h
+}
+
+func nextRand(state *BattleState) uint64 {
+	if state == nil {
+		return 0
+	}
+	x := state.RNGState
+	if x == 0 {
+		x = 0x9e3779b97f4a7c15 ^ uint64(state.Turn+1)
+	}
+	x ^= x >> 12
+	x ^= x << 25
+	x ^= x >> 27
+	state.RNGState = x
+	return x * 2685821657736338717
+}
+
+func randomInt(state *BattleState, n int) int {
+	if n <= 1 {
+		return 0
+	}
+	return int(nextRand(state) % uint64(n))
+}
+
+func randomChance(state *BattleState, numerator, denominator int) bool {
+	if numerator <= 0 {
+		return false
+	}
+	if numerator >= denominator {
+		return true
+	}
+	return randomInt(state, denominator) < numerator
 }
 
 // FastForward runs the events in the replay up to `targetTurn` to rebuild the state
@@ -248,16 +300,32 @@ func initPokemonArray(p *PlayerState, replayTeam map[string]bool) {
 		if idx >= 6 {
 			break
 		}
-		// Reset boost correctly (+6 to 0 shift = 6)
-		// For 7 stats, that is (6<<0)|(6<<4)|(6<<8)|(6<<12)|(6<<16)|(6<<20)|(6<<24) = 114420174
+		maxHP := 100
+		stats := Stats{}
+		if entry := gamedata.LookupSpecies(species); entry != nil {
+			// Replay logs for the opponent often expose percentages, but for the simulator
+			// internals we keep canonical level-100 neutral stats as a baseline.
+			maxHP = entry.BaseStats.HP*2 + 141
+			stats = Stats{
+				HP:  maxHP,
+				Atk: entry.BaseStats.Atk*2 + 36,
+				Def: entry.BaseStats.Def*2 + 36,
+				SpA: entry.BaseStats.SpA*2 + 36,
+				SpD: entry.BaseStats.SpD*2 + 36,
+				Spe: entry.BaseStats.Spe*2 + 36,
+			}
+		}
+		// Reset boosts to neutral (0 stages for all packed stats).
 		p.Team[idx] = PokemonState{
 			Name:     species,
 			Species:  species,
-			HP:       100,
-			MaxHP:    100,
+			Level:    100,
+			HP:       maxHP,
+			MaxHP:    maxHP,
+			Stats:    stats,
 			IsActive: false,
 			Fainted:  false,
-			Boosts:   114420174,
+			Boosts:   NeutralBoosts,
 		}
 		idx++
 	}
@@ -267,12 +335,40 @@ func initPokemonArray(p *PlayerState, replayTeam map[string]bool) {
 }
 
 func findPokemonByName(p *PlayerState, name string) int {
+	needle := gamedata.NormalizeID(name)
 	for i := 0; i < p.TeamSize; i++ {
-		if p.Team[i].Name == name || p.Team[i].Species == name {
+		if gamedata.NormalizeID(p.Team[i].Name) == needle || gamedata.NormalizeID(p.Team[i].Species) == needle {
 			return i
 		}
 	}
 	return -1
+}
+
+func parseConditionHP(cond string) (hp int, maxHP int, fainted bool, ok bool) {
+	cond = strings.TrimSpace(cond)
+	if cond == "" {
+		return 0, 0, false, false
+	}
+	if cond == "0 fnt" {
+		return 0, 100, true, true
+	}
+
+	parts := strings.Fields(cond)
+	hpPart := parts[0]
+	if strings.Contains(hpPart, "/") {
+		hpParts := strings.SplitN(hpPart, "/", 2)
+		if len(hpParts) == 2 {
+			cur, errCur := strconv.Atoi(hpParts[0])
+			max, errMax := strconv.Atoi(hpParts[1])
+			if errCur == nil && errMax == nil && max > 0 {
+				return cur, max, cur <= 0, true
+			}
+		}
+	}
+	if v, err := strconv.Atoi(hpPart); err == nil {
+		return v, 100, v <= 0, true
+	}
+	return 0, 0, false, false
 }
 
 // FastForwardToEvent reconstructs the state exactly up to (and including) the specified event index.
@@ -289,6 +385,7 @@ func FastForwardToEvent(replay *parser.Replay, targetIndex int) (*BattleState, e
 			ActiveIdx:       -1,
 			CanTerastallize: true,
 		},
+		RNGState: seedHash(replay.P1, replay.P2, strconv.Itoa(targetIndex)),
 	}
 
 	// 1. Initialize Teams from the replay
@@ -341,13 +438,29 @@ func FastForwardToEvent(replay *parser.Replay, targetIndex int) (*BattleState, e
 					playerState.Team[idx].IsActive = true
 					playerState.ActiveIdx = idx
 				} else if playerState.TeamSize < 6 {
+					maxHP := 100
+					stats := Stats{}
+					if entry := gamedata.LookupSpecies(speciesName); entry != nil {
+						maxHP = entry.BaseStats.HP*2 + 141
+						stats = Stats{
+							HP:  maxHP,
+							Atk: entry.BaseStats.Atk*2 + 36,
+							Def: entry.BaseStats.Def*2 + 36,
+							SpA: entry.BaseStats.SpA*2 + 36,
+							SpD: entry.BaseStats.SpD*2 + 36,
+							Spe: entry.BaseStats.Spe*2 + 36,
+						}
+					}
 					newIdx := playerState.TeamSize
 					playerState.Team[newIdx] = PokemonState{
-						Name:    speciesName,
-						Species: speciesName,
-						HP:      100, MaxHP: 100,
+						Name:     speciesName,
+						Species:  speciesName,
+						Level:    100,
+						Stats:    stats,
+						HP:       maxHP,
+						MaxHP:    maxHP,
 						IsActive: true, Fainted: false,
-						Boosts: 114420174,
+						Boosts: NeutralBoosts,
 					}
 					playerState.TeamSize++
 					playerState.ActiveIdx = newIdx
@@ -361,15 +474,35 @@ func FastForwardToEvent(replay *parser.Replay, targetIndex int) (*BattleState, e
 			}
 
 		case "damage", "heal":
-			// We no longer guess faints from HP drops because Illusion (Zoroark)
-			// causes the disguised pokemon's name to drop to 0 HP before the 'replace' event.
-			// Showdown always logs an explicit 'faint' event after 'replace', which we handle natively.
-
-			// However, we MUST handle revives. If a Pokemon is healed (e.g. Revival Blessing), it is no longer fainted.
-			if event.Type == "heal" && event.Value != "" {
+			if event.Value != "" {
 				idx := findPokemonByName(playerState, event.Value)
 				if idx != -1 {
-					playerState.Team[idx].Fainted = false
+					poke := &playerState.Team[idx]
+					if split := strings.SplitN(event.Detail, "->", 2); len(split) == 2 {
+						if hp, maxHP, fainted, ok := parseConditionHP(strings.TrimSpace(split[1])); ok {
+							// Replay logs often use percentage bars (x/100). If we already have a
+							// species-derived max HP, project the new percent into that max HP.
+							if maxHP == 100 && poke.MaxHP > 100 {
+								poke.HP = int(math.Round((float64(hp) / 100.0) * float64(poke.MaxHP)))
+							} else {
+								poke.HP = hp
+								poke.MaxHP = maxHP
+							}
+							if poke.HP < 0 {
+								poke.HP = 0
+							}
+							if event.Type == "heal" && poke.HP > 0 {
+								poke.Fainted = false
+							} else if fainted && event.Type == "damage" {
+								// Keep this conservative for damage lines; explicit faint events
+								// still remain the source of truth for edge cases like Illusion.
+								poke.HP = 0
+							}
+						}
+					}
+					if event.Type == "heal" {
+						poke.Fainted = false
+					}
 				}
 			}
 
@@ -527,7 +660,7 @@ func FastForwardToEvent(replay *parser.Replay, targetIndex int) (*BattleState, e
 
 		case "clearallboost", "clearboost":
 			if playerState.ActiveIdx != -1 {
-				playerState.Team[playerState.ActiveIdx].Boosts = 114420174
+				playerState.Team[playerState.ActiveIdx].Boosts = NeutralBoosts
 			}
 
 		case "clearnegativeboost":
@@ -740,6 +873,63 @@ func applyTerastallizeIfNeeded(player *PlayerState, action int) {
 	player.CanTerastallize = false
 }
 
+func markActiveFainted(player *PlayerState) {
+	active := player.GetActive()
+	if active == nil || active.HP > 0 {
+		return
+	}
+	active.HP = 0
+	active.Fainted = true
+	active.IsActive = false
+	player.ActiveIdx = -1
+}
+
+func canActThisTurn(state *BattleState, p *PokemonState) bool {
+	if p == nil || p.Fainted {
+		return false
+	}
+	switch p.Status {
+	case "par":
+		// Full paralysis: 25%
+		if randomChance(state, 1, 4) {
+			return false
+		}
+	case "slp":
+		// Sleep approximation: 2/3 skip, 1/3 wake and move.
+		if randomChance(state, 2, 3) {
+			return false
+		}
+		p.Status = ""
+	case "frz":
+		// Freeze thaw chance each turn: 20%.
+		if randomChance(state, 4, 5) {
+			return false
+		}
+		p.Status = ""
+	}
+	return true
+}
+
+func applyStatusResidual(p *PokemonState) {
+	if p == nil || p.Fainted || p.MaxHP <= 0 {
+		return
+	}
+	switch p.Status {
+	case "brn":
+		dmg := p.MaxHP / 16
+		if dmg < 1 {
+			dmg = 1
+		}
+		p.HP -= dmg
+	case "psn", "tox":
+		dmg := p.MaxHP / 8
+		if dmg < 1 {
+			dmg = 1
+		}
+		p.HP -= dmg
+	}
+}
+
 // ExecuteSpecificTurn applies two integer actions directly to the BattleState
 // 0-3 = Move 1-4, 4-7 = Tera Move 1-4, 8-13 = Switch to slot 0-5
 func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
@@ -783,55 +973,78 @@ func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
 		p1Spe := getEffectiveStat(p1Active, SpeShift, &state.P1.Side)
 		p2Spe := getEffectiveStat(p2Active, SpeShift, &state.P2.Side)
 
-		var firstAtk, secondAtk *PokemonState
-		var firstDef, secondDef *PokemonState
-		var firstSide, secondSide *SideConditions
-		var firstMove, secondMove int
-
-		if p1Spe > p2Spe || (p1Spe == p2Spe && p1Active.HP >= p2Active.HP) {
-			firstAtk, firstDef, firstMove = p1Active, p2Active, p1Action
-			firstSide, secondSide = &state.P1.Side, &state.P2.Side
-			secondAtk, secondDef, secondMove = p2Active, p1Active, p2Action
-		} else {
-			firstAtk, firstDef, firstMove = p2Active, p1Active, p2Action
-			firstSide, secondSide = &state.P2.Side, &state.P1.Side
-			secondAtk, secondDef, secondMove = p1Active, p2Active, p1Action
+		p1First := false
+		switch {
+		case p1Spe > p2Spe:
+			p1First = true
+		case p1Spe < p2Spe:
+			p1First = false
+		default:
+			// Speed ties are random.
+			p1First = randomChance(state, 1, 2)
 		}
 
-		applyMoveDamage(firstAtk, firstDef, BaseMoveIndex(firstMove), secondSide)
-		if firstDef.HP <= 0 {
-			firstDef.HP = 0
-			firstDef.Fainted = true
+		if p1First {
+			p2Flinched := false
+			if canActThisTurn(state, p1Active) {
+				_, p2Flinched = applyMoveDamage(state, p1Active, p2Active, BaseMoveIndex(p1Action), &state.P2.Side)
+			}
+			markActiveFainted(&state.P2)
+			if state.P2.GetActive() != nil && !p2Flinched && canActThisTurn(state, state.P2.GetActive()) {
+				applyMoveDamage(state, state.P2.GetActive(), state.P1.GetActive(), BaseMoveIndex(p2Action), &state.P1.Side)
+			}
 		} else {
-			applyMoveDamage(secondAtk, secondDef, BaseMoveIndex(secondMove), firstSide)
+			p1Flinched := false
+			if canActThisTurn(state, p2Active) {
+				_, p1Flinched = applyMoveDamage(state, p2Active, p1Active, BaseMoveIndex(p2Action), &state.P1.Side)
+			}
+			markActiveFainted(&state.P1)
+			if state.P1.GetActive() != nil && !p1Flinched && canActThisTurn(state, state.P1.GetActive()) {
+				applyMoveDamage(state, state.P1.GetActive(), state.P2.GetActive(), BaseMoveIndex(p1Action), &state.P2.Side)
+			}
 		}
 	} else {
-		if p1Attacks && p2Active != nil {
-			applyMoveDamage(p1Active, p2Active, BaseMoveIndex(p1Action), &state.P2.Side)
-		} else if p2Attacks && p1Active != nil {
-			applyMoveDamage(p2Active, p1Active, BaseMoveIndex(p2Action), &state.P1.Side)
+		if p1Attacks && p2Active != nil && canActThisTurn(state, p1Active) {
+			applyMoveDamage(state, p1Active, p2Active, BaseMoveIndex(p1Action), &state.P2.Side)
+		} else if p2Attacks && p1Active != nil && canActThisTurn(state, p2Active) {
+			applyMoveDamage(state, p2Active, p1Active, BaseMoveIndex(p2Action), &state.P1.Side)
 		}
 	}
 
+	// End-of-turn residual statuses.
+	applyStatusResidual(state.P1.GetActive())
+	applyStatusResidual(state.P2.GetActive())
+
 	// Check for faints
-	if p1Active != nil && p1Active.HP <= 0 {
-		p1Active.HP = 0
-		p1Active.Fainted = true
-		p1Active.IsActive = false
-		state.P1.ActiveIdx = -1
-	}
-	if p2Active != nil && p2Active.HP <= 0 {
-		p2Active.HP = 0
-		p2Active.Fainted = true
-		p2Active.IsActive = false
-		state.P2.ActiveIdx = -1
-	}
+	markActiveFainted(&state.P1)
+	markActiveFainted(&state.P2)
 }
 
-// getEffectiveStat computes the stat including base stats, boosts, and status conditions.
+func normalizedName(s string) string {
+	return gamedata.NormalizeID(s)
+}
+
+func statBoostMultiplier(boost int) float64 {
+	if boost >= 0 {
+		return float64(2+boost) / 2.0
+	}
+	return 2.0 / float64(2-boost)
+}
+
+func accuracyStageMultiplier(stage int) float64 {
+	if stage >= 0 {
+		return float64(3+stage) / 3.0
+	}
+	return 3.0 / float64(3-stage)
+}
+
+func calcNonHPStat(base, iv, ev, level int) int {
+	return ((2*base+iv+(ev/4))*level)/100 + 5
+}
+
+// getEffectiveStat computes the stat including boosts and common battle modifiers.
 func getEffectiveStat(p *PokemonState, shift uint32, side *SideConditions) float64 {
 	base := 0.0
-	// 1. Check if actual stats are already computed
 	switch shift {
 	case AtkShift:
 		base = float64(p.Stats.Atk)
@@ -845,43 +1058,48 @@ func getEffectiveStat(p *PokemonState, shift uint32, side *SideConditions) float
 		base = float64(p.Stats.Spe)
 	}
 
-	// 2. Fallback to base stat calculation if actual stats are missing
 	if base == 0 {
 		entry := gamedata.LookupSpecies(p.Species)
 		if entry != nil {
-			lvl := 100
+			level := 100
 			if p.Level > 0 {
-				lvl = p.Level
+				level = p.Level
 			}
-
-			var b int
+			iv, ev := 31, 0
 			switch shift {
 			case AtkShift:
-				b = entry.BaseStats.Atk
+				if p.IVs.Atk > 0 || p.EVs.Atk > 0 {
+					iv, ev = p.IVs.Atk, p.EVs.Atk
+				}
+				base = float64(calcNonHPStat(entry.BaseStats.Atk, iv, ev, level))
 			case DefShift:
-				b = entry.BaseStats.Def
+				if p.IVs.Def > 0 || p.EVs.Def > 0 {
+					iv, ev = p.IVs.Def, p.EVs.Def
+				}
+				base = float64(calcNonHPStat(entry.BaseStats.Def, iv, ev, level))
 			case SpaShift:
-				b = entry.BaseStats.SpA
+				if p.IVs.SpA > 0 || p.EVs.SpA > 0 {
+					iv, ev = p.IVs.SpA, p.EVs.SpA
+				}
+				base = float64(calcNonHPStat(entry.BaseStats.SpA, iv, ev, level))
 			case SpdShift:
-				b = entry.BaseStats.SpD
+				if p.IVs.SpD > 0 || p.EVs.SpD > 0 {
+					iv, ev = p.IVs.SpD, p.EVs.SpD
+				}
+				base = float64(calcNonHPStat(entry.BaseStats.SpD, iv, ev, level))
 			case SpeShift:
-				b = entry.BaseStats.Spe
+				if p.IVs.Spe > 0 || p.EVs.Spe > 0 {
+					iv, ev = p.IVs.Spe, p.EVs.Spe
+				}
+				base = float64(calcNonHPStat(entry.BaseStats.Spe, iv, ev, level))
 			}
-			base = float64(((2*b+31)*lvl)/100 + 5)
-		} else {
-			base = 105
 		}
 	}
-
-	boost := p.GetBoost(shift)
-	var multiplier float64
-	if boost >= 0 {
-		multiplier = float64(2+boost) / 2.0
-	} else {
-		multiplier = 2.0 / float64(2-boost)
+	if base == 0 {
+		base = 105
 	}
 
-	val := base * multiplier
+	val := base * statBoostMultiplier(p.GetBoost(shift))
 	if shift == SpeShift {
 		if p.Status == "par" {
 			val *= 0.5
@@ -892,23 +1110,20 @@ func getEffectiveStat(p *PokemonState, shift uint32, side *SideConditions) float
 	}
 
 	if shift == AtkShift {
-		if p.Status == "brn" {
-			val *= 0.5
-		}
-		if p.Ability == "hugepower" || p.Ability == "purepower" {
+		if normalizedName(p.Ability) == "hugepower" || normalizedName(p.Ability) == "purepower" {
 			val *= 2.0
 		}
-		if p.Item == "choiceband" {
+		if normalizedName(p.Item) == "choiceband" {
 			val *= 1.5
 		}
 	}
-	if shift == DefShift && p.Item == "eviolite" {
+	if shift == DefShift && normalizedName(p.Item) == "eviolite" {
 		val *= 1.5
 	}
-	if shift == SpaShift && p.Item == "choicespecs" {
+	if shift == SpaShift && normalizedName(p.Item) == "choicespecs" {
 		val *= 1.5
 	}
-	if shift == SpdShift && p.Item == "assaultvest" {
+	if shift == SpdShift && normalizedName(p.Item) == "assaultvest" {
 		val *= 1.5
 	}
 
@@ -918,108 +1133,348 @@ func getEffectiveStat(p *PokemonState, shift uint32, side *SideConditions) float
 	return val
 }
 
-// applyMoveDamage calculates type-aware damage from attacker to defender using actual move data.
-func applyMoveDamage(attacker *PokemonState, defender *PokemonState, moveIdx int, side *SideConditions) {
-	atkEntry := gamedata.LookupSpecies(attacker.Species)
-	defEntry := gamedata.LookupSpecies(defender.Species)
+func getMoveAccuracy(move *gamedata.MoveEntry) (float64, bool) {
+	if move == nil {
+		return 100.0, false
+	}
+	switch v := move.Accuracy.(type) {
+	case bool:
+		return 0, v
+	case int:
+		return float64(v), false
+	case int64:
+		return float64(v), false
+	case float64:
+		return v, false
+	default:
+		return 100.0, false
+	}
+}
 
-	var moveEntry *gamedata.MoveEntry
-	if moveIdx >= 0 && moveIdx < 4 {
-		moveEntry = gamedata.LookupMove(attacker.Moves[moveIdx])
+func moveHits(state *BattleState, attacker *PokemonState, defender *PokemonState, move *gamedata.MoveEntry) bool {
+	baseAcc, alwaysHit := getMoveAccuracy(move)
+	if alwaysHit {
+		return true
+	}
+	if baseAcc <= 0 {
+		return false
+	}
+	acc := baseAcc * accuracyStageMultiplier(attacker.GetBoost(AccShift)) / accuracyStageMultiplier(defender.GetBoost(EvaShift))
+	if acc <= 0 {
+		return false
+	}
+	if acc >= 100 {
+		return true
+	}
+	roll := float64(randomInt(state, 10000)) / 100.0
+	return roll < acc
+}
+
+func critChanceNumerator(stage int) int {
+	switch {
+	case stage <= 0:
+		return 1 // 1/24
+	case stage == 1:
+		return 1 // 1/8
+	case stage == 2:
+		return 1 // 1/2
+	default:
+		return 1 // guaranteed at denominator 1
+	}
+}
+
+func critChanceDenominator(stage int) int {
+	switch {
+	case stage <= 0:
+		return 24
+	case stage == 1:
+		return 8
+	case stage == 2:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func moveIsCritical(state *BattleState, attacker *PokemonState, move *gamedata.MoveEntry) bool {
+	if move == nil {
+		return false
+	}
+	if move.WillCrit {
+		return true
+	}
+	stage := move.CritRatio
+	if (attacker.Volatiles & VolatileFocusEnergy) != 0 {
+		stage += 2
+	}
+	return randomChance(state, critChanceNumerator(stage), critChanceDenominator(stage))
+}
+
+func hasType(types []string, t string) bool {
+	for _, existing := range types {
+		if existing == t {
+			return true
+		}
+	}
+	return false
+}
+
+func stabModifier(attacker *PokemonState, atkEntry *gamedata.PokedexEntry, moveType string) float64 {
+	if moveType == "" || atkEntry == nil {
+		return 1.0
+	}
+	ability := normalizedName(attacker.Ability)
+	hasOriginalType := hasType(atkEntry.Types, moveType)
+	adaptability := ability == "adaptability"
+
+	if attacker.Terastallized && attacker.TeraType != "" {
+		if moveType == attacker.TeraType && hasOriginalType {
+			if adaptability {
+				return 2.25
+			}
+			return 2.0
+		}
+		if moveType == attacker.TeraType || hasOriginalType {
+			if adaptability {
+				return 2.0
+			}
+			return 1.5
+		}
+		return 1.0
+	}
+
+	if hasOriginalType {
+		if adaptability {
+			return 2.0
+		}
+		return 1.5
+	}
+	return 1.0
+}
+
+func clampHP(p *PokemonState) {
+	if p.MaxHP <= 0 {
+		p.MaxHP = 1
+	}
+	if p.HP > p.MaxHP {
+		p.HP = p.MaxHP
+	}
+	if p.HP < 0 {
+		p.HP = 0
+	}
+}
+
+func applyBoostMap(target *PokemonState, boosts map[string]int) {
+	if target == nil || len(boosts) == 0 {
+		return
+	}
+	for stat, delta := range boosts {
+		shift, ok := GetStatShift(stat)
+		if !ok {
+			continue
+		}
+		target.SetBoost(shift, target.GetBoost(shift)+delta)
+	}
+}
+
+func applySecondary(state *BattleState, sec gamedata.MoveSecondary, attacker *PokemonState, defender *PokemonState) bool {
+	if sec.Chance > 0 && !randomChance(state, sec.Chance, 100) {
+		return false
+	}
+	if sec.Status != "" && defender.Status == "" {
+		defender.Status = sec.Status
+	}
+	if sec.VolatileStatus == "flinch" {
+		return true
+	}
+	if sec.VolatileStatus != "" {
+		defender.ToggleVolatile(MapVolatileToBit(sec.VolatileStatus), true)
+	}
+	applyBoostMap(defender, sec.Boosts)
+	if sec.Self != nil {
+		applyBoostMap(attacker, sec.Self.Boosts)
+	}
+	return false
+}
+
+func applyMoveEffects(state *BattleState, move *gamedata.MoveEntry, attacker *PokemonState, defender *PokemonState, damageDealt int) bool {
+	if move == nil {
+		return false
+	}
+	flinch := false
+
+	if move.Status != "" && defender.Status == "" {
+		defender.Status = move.Status
+	}
+	if move.VolatileStatus == "flinch" {
+		flinch = true
+	} else if move.VolatileStatus != "" {
+		defender.ToggleVolatile(MapVolatileToBit(move.VolatileStatus), true)
+	}
+
+	if len(move.Boosts) > 0 {
+		if move.Target == "self" {
+			applyBoostMap(attacker, move.Boosts)
+		} else {
+			applyBoostMap(defender, move.Boosts)
+		}
+	}
+
+	if move.Secondary != nil {
+		if applySecondary(state, *move.Secondary, attacker, defender) {
+			flinch = true
+		}
+	}
+	for _, sec := range move.Secondaries {
+		if applySecondary(state, sec, attacker, defender) {
+			flinch = true
+		}
+	}
+
+	if damageDealt > 0 {
+		if move.Drain[1] > 0 && move.Drain[0] > 0 {
+			heal := int(math.Round(float64(damageDealt) * float64(move.Drain[0]) / float64(move.Drain[1])))
+			if heal < 1 {
+				heal = 1
+			}
+			attacker.HP += heal
+		}
+		if move.Recoil[1] > 0 && move.Recoil[0] > 0 {
+			recoil := int(math.Round(float64(damageDealt) * float64(move.Recoil[0]) / float64(move.Recoil[1])))
+			if recoil < 1 {
+				recoil = 1
+			}
+			attacker.HP -= recoil
+		}
+	}
+	if move.Healing[1] > 0 && move.Healing[0] > 0 {
+		heal := int(math.Round(float64(attacker.MaxHP) * float64(move.Healing[0]) / float64(move.Healing[1])))
+		if heal < 1 {
+			heal = 1
+		}
+		attacker.HP += heal
+	}
+
+	clampHP(attacker)
+	clampHP(defender)
+	return flinch
+}
+
+// applyMoveDamage applies a single move resolution.
+// Returns (moveHit, defenderFlinched).
+func applyMoveDamage(state *BattleState, attacker *PokemonState, defender *PokemonState, moveIdx int, defenderSide *SideConditions) (bool, bool) {
+	if attacker == nil || defender == nil || moveIdx < 0 || moveIdx >= 4 {
+		return false, false
+	}
+
+	moveEntry := gamedata.LookupMove(attacker.Moves[moveIdx])
+	if !moveHits(state, attacker, defender, moveEntry) {
+		return false, false
 	}
 
 	if moveEntry != nil && moveEntry.Category == "Status" {
-		return
+		flinch := applyMoveEffects(state, moveEntry, attacker, defender, 0)
+		clampHP(attacker)
+		clampHP(defender)
+		return true, flinch
 	}
 
+	atkEntry := gamedata.LookupSpecies(attacker.Species)
+	defEntry := gamedata.LookupSpecies(defender.Species)
 	if atkEntry == nil || defEntry == nil {
 		defender.HP -= 15
-		return
+		clampHP(defender)
+		return true, false
 	}
 
 	power := 80.0
 	moveType := ""
-	isPhys := true
-
-	if moveEntry != nil && moveEntry.BasePower > 0 {
-		power = float64(moveEntry.BasePower)
+	isPhysical := true
+	if moveEntry != nil {
+		if moveEntry.BasePower > 0 {
+			power = float64(moveEntry.BasePower)
+		}
 		moveType = moveEntry.Type
-		isPhys = moveEntry.Category == "Physical"
+		isPhysical = moveEntry.Category != "Special"
+	}
+	if power <= 0 {
+		flinch := applyMoveEffects(state, moveEntry, attacker, defender, 0)
+		clampHP(attacker)
+		clampHP(defender)
+		return true, flinch
 	}
 
-	var atkStat, defStat float64
-	if isPhys {
-		atkStat = getEffectiveStat(attacker, AtkShift, nil)
-		defStat = getEffectiveStat(defender, DefShift, side)
+	attackStat := 1.0
+	defenseStat := 1.0
+	if isPhysical {
+		attackStat = getEffectiveStat(attacker, AtkShift, nil)
+		defenseStat = getEffectiveStat(defender, DefShift, defenderSide)
 	} else {
-		atkStat = getEffectiveStat(attacker, SpaShift, nil)
-		defStat = getEffectiveStat(defender, SpdShift, side)
+		attackStat = getEffectiveStat(attacker, SpaShift, nil)
+		defenseStat = getEffectiveStat(defender, SpdShift, defenderSide)
+	}
+	if defenseStat < 1 {
+		defenseStat = 1
 	}
 
-	ratio := atkStat / defStat
 	level := 100.0
 	if attacker.Level > 0 {
 		level = float64(attacker.Level)
 	}
+	baseDamage := math.Floor((math.Floor((2.0*level)/5.0+2.0) * power * attackStat / defenseStat / 50.0) + 2.0)
+	if baseDamage < 1 {
+		baseDamage = 1
+	}
 
-	// Gen 9 damage formula
-	damage := ((2.0*level/5.0+2.0)*power*ratio)/50.0 + 2.0
-	modifiers := 0.925 // average random roll
+	critical := moveIsCritical(state, attacker, moveEntry)
+	modifier := float64(randomInt(state, 16)+85) / 100.0
+	if critical {
+		modifier *= 1.5
+	}
 
-	// STAB (Gen 9 Terastallization-aware)
 	if moveType != "" {
-		if attacker.Terastallized && attacker.TeraType != "" {
-			if moveType == attacker.TeraType {
-				stab := 1.5
-				for _, t := range atkEntry.Types {
-					if t == moveType {
-						stab = 2.0
-						break
-					}
-				}
-				modifiers *= stab
-			}
-		} else {
-			for _, t := range atkEntry.Types {
-				if t == moveType {
-					modifiers *= 1.5
-					break
-				}
-			}
+		modifier *= stabModifier(attacker, atkEntry, moveType)
+		effectiveness := gamedata.CalcTypeEffectiveness(moveType, getCurrentTypes(defender, defEntry))
+		if effectiveness == 0 {
+			return true, false
+		}
+		modifier *= effectiveness
+	}
+
+	if isPhysical && attacker.Status == "brn" && normalizedName(attacker.Ability) != "guts" {
+		modifier *= 0.5
+	}
+
+	if defenderSide != nil && !critical {
+		if isPhysical && (defenderSide.Reflect || defenderSide.AuroraVeil) {
+			modifier *= 0.5
+		} else if !isPhysical && (defenderSide.LightScreen || defenderSide.AuroraVeil) {
+			modifier *= 0.5
 		}
 	}
 
-	// Type Effectiveness
-	if moveType != "" {
-		modifiers *= gamedata.CalcTypeEffectiveness(moveType, getCurrentTypes(defender, defEntry))
+	if normalizedName(attacker.Item) == "lifeorb" {
+		modifier *= 1.3
 	}
-
-	// Item/Ability/Gender Modifiers
-	if attacker.Item == "lifeorb" {
-		modifiers *= 1.3
-	}
-	if attacker.Ability == "rivalry" && attacker.Gender != "N" && defender.Gender != "N" {
+	if normalizedName(attacker.Ability) == "rivalry" && attacker.Gender != "N" && defender.Gender != "N" {
 		if attacker.Gender == defender.Gender {
-			modifiers *= 1.25
+			modifier *= 1.25
 		} else {
-			modifiers *= 0.75
+			modifier *= 0.75
 		}
 	}
 
-	// Screens
-	if side != nil {
-		if isPhys && (side.Reflect || side.AuroraVeil) {
-			modifiers *= 0.5
-		} else if !isPhys && (side.LightScreen || side.AuroraVeil) {
-			modifiers *= 0.5
-		}
+	finalDamage := int(math.Floor(baseDamage * modifier))
+	if finalDamage < 1 && modifier > 0 {
+		finalDamage = 1
 	}
+	if finalDamage > defender.HP {
+		finalDamage = defender.HP
+	}
+	defender.HP -= finalDamage
+	clampHP(defender)
 
-	finalDamage := damage * modifiers
-	defenderMaxHP := float64(defender.MaxHP)
-	if defenderMaxHP == 0 {
-		defenderMaxHP = float64(defEntry.BaseStats.HP*2 + 141)
-	}
-	damagePercent := (finalDamage / defenderMaxHP) * 100.0
-	defender.HP -= int(damagePercent)
+	flinch := applyMoveEffects(state, moveEntry, attacker, defender, finalDamage)
+	clampHP(attacker)
+	return true, flinch
 }

@@ -14,7 +14,7 @@ func TestGetSearchActionsIncludesTeraMoves(t *testing.T) {
 		IsActive:      true,
 		NumMoves:      2,
 		TeraType:      "Electric",
-		Boosts:        114420174,
+		Boosts:        NeutralBoosts,
 		Moves:         [4]string{"thunderbolt", "voltswitch"},
 		MaxHP:         100,
 		HP:            100,
@@ -54,7 +54,7 @@ func TestExecuteSpecificTurnConsumesTerastallize(t *testing.T) {
 		NumMoves:      1,
 		Moves:         [4]string{"thunderbolt"},
 		TeraType:      "Electric",
-		Boosts:        114420174,
+		Boosts:        NeutralBoosts,
 		MaxHP:         100,
 		HP:            100,
 		Terastallized: false,
@@ -62,7 +62,7 @@ func TestExecuteSpecificTurnConsumesTerastallize(t *testing.T) {
 	state.P2.Team[0] = PokemonState{
 		Species:  "Eevee",
 		IsActive: true,
-		Boosts:   114420174,
+		Boosts:   NeutralBoosts,
 		MaxHP:    100,
 		HP:       100,
 	}

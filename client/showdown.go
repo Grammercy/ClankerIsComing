@@ -205,7 +205,7 @@ func (b *ShowdownBot) onOpponentAction(roomID, data string, isSwitch bool) {
 				Species: "Unknown",
 				HP:      100,
 				MaxHP:   100,
-				Boosts:  114420174,
+				Boosts:  simulator.NeutralBoosts,
 			}
 		}
 	} else if ctx.State.P2.TeamSize < 6 {
@@ -359,7 +359,7 @@ func (b *ShowdownBot) onOpponentUpdate(roomID, data, updateType string) {
 			}
 		}
 	case "clearallboost":
-		active.Boosts = 114420174
+		active.Boosts = simulator.NeutralBoosts
 	case "item":
 		if len(parts) >= 2 {
 			active.Item = strings.ToLower(strings.ReplaceAll(parts[1], " ", ""))
@@ -613,7 +613,7 @@ func (b *ShowdownBot) onPoke(roomID, data string) {
 				Species: "Unknown",
 				HP:      100,
 				MaxHP:   100,
-				Boosts:  114420174,
+				Boosts:  simulator.NeutralBoosts,
 			}
 		}
 	}

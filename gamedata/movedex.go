@@ -4,17 +4,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 )
 
 // MoveEntry holds the data we need from each move
 type MoveEntry struct {
-	Name      string `json:"name"`
-	BasePower int    `json:"basePower"`
-	Type      string `json:"type"`
-	Category  string `json:"category"` // "Physical", "Special", "Status"
-	Accuracy  any    `json:"accuracy"` // can be int or bool (true = always hits)
-	PP        int    `json:"pp"`
+	Name           string          `json:"name"`
+	BasePower      int             `json:"basePower"`
+	Type           string          `json:"type"`
+	Category       string          `json:"category"` // "Physical", "Special", "Status"
+	Accuracy       any             `json:"accuracy"` // can be int, float64, or bool (true = always hits)
+	PP             int             `json:"pp"`
+	Priority       int             `json:"priority"`
+	CritRatio      int             `json:"critRatio"`
+	WillCrit       bool            `json:"willCrit"`
+	Status         string          `json:"status"`
+	Boosts         map[string]int  `json:"boosts"`
+	Secondary      *MoveSecondary  `json:"secondary"`
+	Secondaries    []MoveSecondary `json:"secondaries"`
+	Drain          [2]int          `json:"drain"`
+	Recoil         [2]int          `json:"recoil"`
+	Healing        [2]int          `json:"heal"`
+	VolatileStatus string          `json:"volatileStatus"`
+	ForceSwitch    bool            `json:"forceSwitch"`
+	Target         string          `json:"target"`
+}
+
+type MoveSecondary struct {
+	Chance         int            `json:"chance"`
+	Status         string         `json:"status"`
+	VolatileStatus string         `json:"volatileStatus"`
+	Boosts         map[string]int `json:"boosts"`
+	Self           *MoveSelf      `json:"self"`
+}
+
+type MoveSelf struct {
+	Boosts map[string]int `json:"boosts"`
 }
 
 // Movedex is the global lookup map: normalized ID -> entry
@@ -51,7 +75,7 @@ func LookupMove(name string) *MoveEntry {
 	if Movedex == nil {
 		return nil
 	}
-	key := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, " ", ""), "-", ""))
+	key := NormalizeID(name)
 	if entry, ok := Movedex[key]; ok {
 		return entry
 	}
