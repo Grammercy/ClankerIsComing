@@ -573,3 +573,213 @@ func TestSwiftSwimInRainChangesMoveOrder(t *testing.T) {
 		t.Fatalf("expected Swift Swim user to outspeed and KO in rain")
 	}
 }
+func TestStealthRockDamage(t *testing.T) {
+	ensureGameData(t)
+
+	state := &BattleState{
+		RNGState: 1,
+		P1: PlayerState{
+			ID:        "p1",
+			TeamSize:  2,
+			ActiveIdx: 0,
+			Side:      SideConditions{StealthRock: true},
+			Team: [6]PokemonState{
+				{
+					Species:  "Talonflame",
+					IsActive: true,
+					MaxHP:    300,
+					HP:       300,
+					Boosts:   NeutralBoosts,
+				},
+				{
+					Species:  "Charizard",
+					IsActive: false,
+					MaxHP:    300,
+					HP:       300,
+					Boosts:   NeutralBoosts,
+				},
+			},
+		},
+		P2: PlayerState{
+			ID:        "p2",
+			TeamSize:  1,
+			ActiveIdx: 0,
+			Team: [6]PokemonState{
+				{
+					Species:  "Venusaur",
+					IsActive: true,
+					MaxHP:    300,
+					HP:       300,
+					Boosts:   NeutralBoosts,
+				},
+			},
+		},
+	}
+
+	// Switch p1 slot 0 (Talonflame) to slot 1 (Charizard)
+	ExecuteSpecificTurn(state, ActionSwitchBase+1, -1)
+
+	// Charizard is 4x weak to Rock, so it should take 50% damage
+	expectedHP := 150
+	if got := state.P1.Team[1].HP; got != expectedHP {
+		t.Fatalf("expected Charizard HP to be %d after Stealth Rock, got %d", expectedHP, got)
+	}
+}
+
+func TestSpikesDamage(t *testing.T) {
+	ensureGameData(t)
+
+	tests := []struct {
+		layers   int
+		expected int // HP after damage
+	}{
+		{1, 263}, // 300 - 300/8 = 300 - 37 = 263
+		{2, 250}, // 300 - 300/6 = 300 - 50 = 250
+		{3, 225}, // 300 - 300/4 = 300 - 75 = 225
+	}
+
+	for _, tt := range tests {
+		state := &BattleState{
+			P1: PlayerState{
+				ID:        "p1",
+				TeamSize:  2,
+				ActiveIdx: 0,
+				Side:      SideConditions{Spikes: tt.layers},
+				Team: [6]PokemonState{
+					{Species: "talonflame", IsActive: true, MaxHP: 300, HP: 300, Boosts: NeutralBoosts},
+					{Species: "lucario", IsActive: false, MaxHP: 300, HP: 300, Boosts: NeutralBoosts},
+				},
+			},
+			P2: PlayerState{ID: "p2", TeamSize: 1, ActiveIdx: 0, Team: [6]PokemonState{{Species: "Venusaur", IsActive: true, MaxHP: 300, HP: 300}}},
+		}
+		ExecuteSpecificTurn(state, ActionSwitchBase+1, -1)
+		if got := state.P1.Team[1].HP; got != tt.expected {
+			t.Errorf("expected HP %d for %d layers of Spikes, got %d", tt.expected, tt.layers, got)
+		}
+	}
+}
+
+func TestToxicSpikesEffect(t *testing.T) {
+	ensureGameData(t)
+
+	// 1 layer -> Poison
+	state1 := &BattleState{
+		P1: PlayerState{
+			ID:        "p1",
+			TeamSize:  2,
+			ActiveIdx: 0,
+			Side:      SideConditions{ToxicSpikes: 1},
+			Team: [6]PokemonState{
+				{Species: "talonflame", IsActive: true, MaxHP: 300, HP: 300},
+				{Species: "lucario", IsActive: false, MaxHP: 300, HP: 300}, // Lucario is Steel, immune
+			},
+		},
+		P2: PlayerState{ID: "p2", TeamSize: 1, ActiveIdx: 0, Team: [6]PokemonState{{Species: "Venusaur", IsActive: true}}},
+	}
+	ExecuteSpecificTurn(state1, ActionSwitchBase+1, -1)
+	if state1.P1.Team[1].Status != "" {
+		t.Errorf("expected Steel-type Lucario to be immune to Toxic Spikes, got status %q", state1.P1.Team[1].Status)
+	}
+
+	// 2 layers -> Toxic
+	state2 := &BattleState{
+		P1: PlayerState{
+			ID:        "p1",
+			TeamSize:  2,
+			ActiveIdx: 0,
+			Side:      SideConditions{ToxicSpikes: 2},
+			Team: [6]PokemonState{
+				{Species: "talonflame", IsActive: true, MaxHP: 300, HP: 300},
+				{Species: "pikachu", IsActive: false, MaxHP: 300, HP: 300},
+			},
+		},
+		P2: PlayerState{ID: "p2", TeamSize: 1, ActiveIdx: 0},
+	}
+	ExecuteSpecificTurn(state2, ActionSwitchBase+1, -1)
+	if state2.P1.Team[1].Status != "tox" {
+		t.Errorf("expected 2 layers of Toxic Spikes to cause 'tox', got %q", state2.P1.Team[1].Status)
+	}
+
+	// Poison-type absorbs
+	state3 := &BattleState{
+		P1: PlayerState{
+			ID:        "p1",
+			TeamSize:  2,
+			ActiveIdx: 0,
+			Side:      SideConditions{ToxicSpikes: 2},
+			Team: [6]PokemonState{
+				{Species: "talonflame", IsActive: true, HP: 100, MaxHP: 100, Boosts: NeutralBoosts},
+				{Species: "muk", IsActive: false, HP: 351, MaxHP: 351, Boosts: NeutralBoosts},
+			},
+		},
+		P2: PlayerState{ID: "p2", TeamSize: 1, ActiveIdx: 0},
+	}
+	ExecuteSpecificTurn(state3, ActionSwitchBase+1, -1)
+	if state3.P1.Side.ToxicSpikes != 0 {
+		t.Errorf("expected Poison-type Muk to absorb Toxic Spikes, but layers remain %d", state3.P1.Side.ToxicSpikes)
+	}
+}
+
+func TestStickyWebEffect(t *testing.T) {
+	ensureGameData(t)
+
+	state := &BattleState{
+		P1: PlayerState{
+			ID:        "p1",
+			TeamSize:  2,
+			ActiveIdx: 0,
+			Side:      SideConditions{StickyWeb: true},
+			Team: [6]PokemonState{
+				{Species: "talonflame", IsActive: true, HP: 100, MaxHP: 100},
+				{Species: "pikachu", IsActive: false, HP: 300, MaxHP: 300, Boosts: NeutralBoosts},
+			},
+		},
+		P2: PlayerState{ID: "p2", TeamSize: 1, ActiveIdx: 0},
+	}
+	ExecuteSpecificTurn(state, ActionSwitchBase+1, -1)
+	if got := state.P1.Team[1].GetBoost(SpeShift); got != -1 {
+		t.Errorf("expected speed boost -1 from Sticky Web, got %d", got)
+	}
+
+	// Contrary test
+	state2 := &BattleState{
+		P1: PlayerState{
+			ID:        "p1",
+			TeamSize:  2,
+			ActiveIdx: 0,
+			Side:      SideConditions{StickyWeb: true},
+			Team: [6]PokemonState{
+				{Species: "talonflame", IsActive: true, HP: 100, MaxHP: 100, Boosts: NeutralBoosts},
+				{Species: "shuckle", IsActive: false, HP: 100, MaxHP: 100, Ability: "contrary", Boosts: NeutralBoosts}, // Shuckle has Contrary
+			},
+		},
+		P2: PlayerState{ID: "p2", TeamSize: 1, ActiveIdx: 0, Team: [6]PokemonState{{Species: "Venusaur", IsActive: true, MaxHP: 300, HP: 300, Boosts: NeutralBoosts}}},
+	}
+	ExecuteSpecificTurn(state2, ActionSwitchBase+1, -1)
+	if got := state2.P1.Team[1].GetBoost(SpeShift); got != 1 {
+		t.Errorf("expected speed boost +1 for Contrary Shuckle from Sticky Web, got %d", got)
+	}
+}
+
+func TestHeavyDutyBoots(t *testing.T) {
+	ensureGameData(t)
+
+	state := &BattleState{
+		P1: PlayerState{
+			ID:        "p1",
+			TeamSize:  2,
+			ActiveIdx: 0,
+			Side:      SideConditions{StealthRock: true, Spikes: 3, ToxicSpikes: 2, StickyWeb: true},
+			Team: [6]PokemonState{
+				{Species: "Talonflame", IsActive: true},
+				{Species: "Charizard", Item: "Heavy-Duty Boots", IsActive: false, MaxHP: 100, HP: 100, Boosts: NeutralBoosts},
+			},
+		},
+		P2: PlayerState{ID: "p2", TeamSize: 1, ActiveIdx: 0},
+	}
+	ExecuteSpecificTurn(state, ActionSwitchBase+1, -1)
+	char := &state.P1.Team[1]
+	if char.HP != 100 || char.Status != "" || char.GetBoost(SpeShift) != 0 {
+		t.Errorf("expected Heavy-Duty Boots to ignore all hazards; HP=%d Status=%q SpeBoost=%d", char.HP, char.Status, char.GetBoost(SpeShift))
+	}
+}

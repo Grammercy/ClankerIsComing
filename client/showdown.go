@@ -486,17 +486,17 @@ func (b *ShowdownBot) onSideUpdate(roomID, data, updateType string) {
 		case strings.Contains(val, "Sticky Web"):
 			side.StickyWeb = true
 		case strings.Contains(val, "Reflect"):
-			side.Reflect = true
+			side.ReflectTurns = 5
 		case strings.Contains(val, "Light Screen"):
-			side.LightScreen = true
+			side.LightScreenTurns = 5
 		case strings.Contains(val, "Aurora Veil"):
-			side.AuroraVeil = true
+			side.AuroraVeilTurns = 5
 		case strings.Contains(val, "Tailwind"):
-			side.Tailwind = true
+			side.TailwindTurns = 4
 		case strings.Contains(val, "Safeguard"):
-			side.Safeguard = true
+			side.SafeguardTurns = 5
 		case strings.Contains(val, "Mist"):
-			side.Mist = true
+			side.MistTurns = 5
 		}
 	} else {
 		switch {
@@ -509,17 +509,17 @@ func (b *ShowdownBot) onSideUpdate(roomID, data, updateType string) {
 		case strings.Contains(val, "Sticky Web"):
 			side.StickyWeb = false
 		case strings.Contains(val, "Reflect"):
-			side.Reflect = false
+			side.ReflectTurns = 0
 		case strings.Contains(val, "Light Screen"):
-			side.LightScreen = false
+			side.LightScreenTurns = 0
 		case strings.Contains(val, "Aurora Veil"):
-			side.AuroraVeil = false
+			side.AuroraVeilTurns = 0
 		case strings.Contains(val, "Tailwind"):
-			side.Tailwind = false
+			side.TailwindTurns = 0
 		case strings.Contains(val, "Safeguard"):
-			side.Safeguard = false
+			side.SafeguardTurns = 0
 		case strings.Contains(val, "Mist"):
-			side.Mist = false
+			side.MistTurns = 0
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -106,6 +107,7 @@ type PokemonState struct {
 	DisguiseBroken bool
 	IceFaceBroken  bool
 	TurnsActive    int
+	LockedMove     string
 }
 
 // GetBoost returns the boost value (-6 to +6) for a given shift
@@ -206,16 +208,16 @@ type FieldConditions struct {
 
 // SideConditions tracks per-side hazards and screens
 type SideConditions struct {
-	StealthRock bool
-	Spikes      int // 0-3 layers
-	ToxicSpikes int // 0-2 layers
-	StickyWeb   bool
-	Reflect     bool
-	LightScreen bool
-	AuroraVeil  bool
-	Tailwind    bool
-	Safeguard   bool
-	Mist        bool
+	StealthRock      bool
+	Spikes           int // 0-3 layers
+	ToxicSpikes      int // 0-2 layers
+	StickyWeb        bool
+	ReflectTurns     int
+	LightScreenTurns int
+	AuroraVeilTurns  int
+	TailwindTurns    int
+	SafeguardTurns   int
+	MistTurns        int
 }
 
 // PlayerState tracks the team and active Pokemon for a player
@@ -575,17 +577,29 @@ func ApplyEvent(state *BattleState, event parser.Event) {
 		case strings.Contains(event.Value, "Sticky Web"):
 			side.StickyWeb = true
 		case strings.Contains(event.Value, "Reflect"):
-			side.Reflect = true
+			duration := 5
+			if act := playerState.GetActive(); act != nil && normalizedName(act.Item) == "lightclay" {
+				duration = 8
+			}
+			side.ReflectTurns = duration
 		case strings.Contains(event.Value, "Light Screen"):
-			side.LightScreen = true
+			duration := 5
+			if act := playerState.GetActive(); act != nil && normalizedName(act.Item) == "lightclay" {
+				duration = 8
+			}
+			side.LightScreenTurns = duration
 		case strings.Contains(event.Value, "Aurora Veil"):
-			side.AuroraVeil = true
+			duration := 5
+			if act := playerState.GetActive(); act != nil && normalizedName(act.Item) == "lightclay" {
+				duration = 8
+			}
+			side.AuroraVeilTurns = duration
 		case strings.Contains(event.Value, "Tailwind"):
-			side.Tailwind = true
+			side.TailwindTurns = 4
 		case strings.Contains(event.Value, "Safeguard"):
-			side.Safeguard = true
+			side.SafeguardTurns = 5
 		case strings.Contains(event.Value, "Mist"):
-			side.Mist = true
+			side.MistTurns = 5
 		}
 
 	case "sideend":
@@ -603,17 +617,17 @@ func ApplyEvent(state *BattleState, event parser.Event) {
 		case strings.Contains(event.Value, "Sticky Web"):
 			side.StickyWeb = false
 		case strings.Contains(event.Value, "Reflect"):
-			side.Reflect = false
+			side.ReflectTurns = 0
 		case strings.Contains(event.Value, "Light Screen"):
-			side.LightScreen = false
+			side.LightScreenTurns = 0
 		case strings.Contains(event.Value, "Aurora Veil"):
-			side.AuroraVeil = false
+			side.AuroraVeilTurns = 0
 		case strings.Contains(event.Value, "Tailwind"):
-			side.Tailwind = false
+			side.TailwindTurns = 0
 		case strings.Contains(event.Value, "Safeguard"):
-			side.Safeguard = false
+			side.SafeguardTurns = 0
 		case strings.Contains(event.Value, "Mist"):
-			side.Mist = false
+			side.MistTurns = 0
 		}
 
 	case "start":
@@ -777,9 +791,13 @@ func GetValidActions(state *BattleState, replay *parser.Replay, playerID string)
 	// 1. Valid Moves
 	activePoke := playerState.GetActive()
 	if activePoke != nil && !activePoke.Fainted {
+		hasChoice := isChoiceItem(activePoke.Item)
 		if playerMoves, playerExists := replay.KnownMoves[playerID]; playerExists {
 			if moves, exists := playerMoves[activePoke.Species]; exists {
 				for move := range moves {
+					if hasChoice && activePoke.LockedMove != "" && normalizedName(move) != normalizedName(activePoke.LockedMove) {
+						continue
+					}
 					actions = append(actions, Action{
 						Type: "move",
 						Name: move,
@@ -874,7 +892,11 @@ func GetSearchActions(player *PlayerState) ([MaxActions]int, int) {
 		if numMoves == 0 {
 			numMoves = 4 // Assume 4 moves for search if none are known
 		}
+		hasChoice := isChoiceItem(active.Item)
 		for m := 0; m < numMoves; m++ {
+			if hasChoice && active.LockedMove != "" && active.Moves[m] != "" && normalizedName(active.Moves[m]) != normalizedName(active.LockedMove) {
+				continue
+			}
 			if count < MaxActions {
 				actions[count] = ActionMove1 + m
 				count++
@@ -883,6 +905,9 @@ func GetSearchActions(player *PlayerState) ([MaxActions]int, int) {
 		// Tera move actions are legal if tera hasn't been used and this active has a tera type.
 		if player.CanTerastallize && !active.Terastallized && active.TeraType != "" {
 			for m := 0; m < numMoves; m++ {
+				if hasChoice && active.LockedMove != "" && active.Moves[m] != "" && normalizedName(active.Moves[m]) != normalizedName(active.LockedMove) {
+					continue
+				}
 				if count < MaxActions {
 					actions[count] = ActionTeraMove1 + m
 					count++
@@ -968,6 +993,11 @@ func normalizeTerrainID(terrain string) string {
 	}
 }
 
+func isChoiceItem(item string) bool {
+	item = normalizedName(item)
+	return item == "choiceband" || item == "choicescarf" || item == "choicespecs"
+}
+
 func onSwitchOut(p *PokemonState) {
 	if p == nil {
 		return
@@ -975,10 +1005,145 @@ func onSwitchOut(p *PokemonState) {
 	if p.Status == "tox" {
 		p.ToxicCounter = 0
 	}
+	if normalizedName(p.Ability) == "zerotohero" && p.Species == "Palafin" {
+		transformToForme(p, "palafinhero")
+	}
 	p.ClearVolatiles()
+	p.LockedMove = ""
 }
 
-func executeSwitchAction(player *PlayerState, action int) bool {
+func transformToForme(p *PokemonState, newSpecies string) {
+	entry := gamedata.LookupSpecies(newSpecies)
+	if entry == nil {
+		return
+	}
+	p.Species = entry.Name
+	// Re-calculate stats based on the new forme's base stats
+	level := 100
+	if p.Level > 0 {
+		level = p.Level
+	}
+	// Note: HP does not normally change during mid-battle forme changes (except Mega)
+	// We keep current HP ratio if possible or just leave HP as is if MaxHP doesn't change.
+	oldMaxHP := p.MaxHP
+	p.MaxHP = entry.BaseStats.HP*2 + 141 // Simplified Level 100 neutral IV/EV
+	if p.MaxHP != oldMaxHP && oldMaxHP > 0 {
+		p.HP = int(math.Round(float64(p.HP) * float64(p.MaxHP) / float64(oldMaxHP)))
+	}
+	p.Stats.Atk = calcNonHPStat(entry.BaseStats.Atk, 31, 0, level)
+	p.Stats.Def = calcNonHPStat(entry.BaseStats.Def, 31, 0, level)
+	p.Stats.SpA = calcNonHPStat(entry.BaseStats.SpA, 31, 0, level)
+	p.Stats.SpD = calcNonHPStat(entry.BaseStats.SpD, 31, 0, level)
+	p.Stats.Spe = calcNonHPStat(entry.BaseStats.Spe, 31, 0, level)
+
+	// Update ability if it changes (e.g. Mega Evolution)
+	if entry.Abilities["0"] != "" {
+		p.Ability = entry.Abilities["0"]
+	}
+}
+
+func applyHazards(state *BattleState, player *PlayerState, active *PokemonState) {
+	if active == nil || active.Fainted {
+		return
+	}
+	if normalizedName(active.Item) == "heavydutyboots" || normalizedName(active.Ability) == "magicguard" {
+		return
+	}
+
+	grounded := isGrounded(state, active)
+	entry := gamedata.LookupSpecies(active.Species)
+	types := getCurrentTypes(active, entry)
+
+	// Stealth Rock
+	if player.Side.StealthRock {
+		eff := gamedata.CalcTypeEffectiveness("Rock", types)
+		if eff > 0 {
+			dmg := int(math.Floor(float64(active.MaxHP) * eff / 8.0))
+			if dmg < 1 {
+				dmg = 1
+			}
+			active.HP -= dmg
+		}
+	}
+	if active.HP <= 0 {
+		active.HP = 0
+		active.Fainted = true
+		return
+	}
+
+	// Spikes
+	if player.Side.Spikes > 0 && grounded {
+		frac := 8
+		if player.Side.Spikes == 2 {
+			frac = 6
+		} else if player.Side.Spikes >= 3 {
+			frac = 4
+		}
+		dmg := active.MaxHP / frac
+		if dmg < 1 {
+			dmg = 1
+		}
+		active.HP -= dmg
+	}
+	if active.HP <= 0 {
+		active.HP = 0
+		active.Fainted = true
+		return
+	}
+
+	// Toxic Spikes
+	if player.Side.ToxicSpikes > 0 && grounded {
+		if hasType(types, "Poison") {
+			player.Side.ToxicSpikes = 0
+		} else if hasType(types, "Steel") || normalizedName(active.Ability) == "immunity" || normalizedName(active.Ability) == "pastelveil" {
+			// Immune
+		} else if active.Status == "" {
+			if player.Side.ToxicSpikes >= 2 {
+				active.Status = "tox"
+				active.ToxicCounter = 0
+			} else {
+				active.Status = "psn"
+			}
+		}
+	}
+	if active.HP <= 0 {
+		active.HP = 0
+		active.Fainted = true
+		return
+	}
+
+	// Sticky Web
+	if player.Side.StickyWeb && grounded {
+		ability := normalizedName(active.Ability)
+		if normalizedName(active.Item) != "clearamulet" && ability != "clearbody" && ability != "whitesmoke" && ability != "fullmetalbody" {
+			amount := -1
+			if ability == "contrary" {
+				amount = 1
+			}
+
+			curSpe := active.GetBoost(SpeShift)
+			if (amount < 0 && curSpe > -6) || (amount > 0 && curSpe < 6) {
+				active.SetBoost(SpeShift, curSpe+amount)
+				if amount < 0 {
+					if ability == "defiant" {
+						curAtk := active.GetBoost(AtkShift)
+						if curAtk < 6 {
+							active.SetBoost(AtkShift, curAtk+2)
+						}
+					} else if ability == "competitive" {
+						curSpa := active.GetBoost(SpaShift)
+						if curSpa < 6 {
+							active.SetBoost(SpaShift, curSpa+2)
+						}
+					}
+				}
+			}
+		}
+	}
+	clampHP(active)
+}
+
+func executeSwitchAction(state *BattleState, player *PlayerState, action int) bool {
 	if action < ActionSwitchBase {
 		return false
 	}
@@ -995,6 +1160,9 @@ func executeSwitchAction(player *PlayerState, action int) bool {
 	}
 	player.Team[idx].IsActive = true
 	player.ActiveIdx = idx
+
+	active := &player.Team[idx]
+	applyHazards(state, player, active)
 	return true
 }
 
@@ -1148,7 +1316,7 @@ func canActThisTurn(state *BattleState, p *PokemonState) bool {
 }
 
 func applyStatusResidual(p *PokemonState) {
-	if p == nil || p.Fainted || p.MaxHP <= 0 {
+	if p == nil || p.Fainted || p.HP <= 0 || p.MaxHP <= 0 {
 		return
 	}
 	ability := normalizedName(p.Ability)
@@ -1195,7 +1363,7 @@ func applyStatusResidual(p *PokemonState) {
 }
 
 func applyWeatherResidual(state *BattleState, p *PokemonState) {
-	if state == nil || p == nil || p.Fainted || p.MaxHP <= 0 {
+	if state == nil || p == nil || p.Fainted || p.HP <= 0 || p.MaxHP <= 0 {
 		return
 	}
 	weather := normalizeWeatherID(state.Field.Weather)
@@ -1242,7 +1410,7 @@ func applyWeatherResidual(state *BattleState, p *PokemonState) {
 }
 
 func applyTerrainResidual(state *BattleState, p *PokemonState) {
-	if state == nil || p == nil || p.Fainted || p.MaxHP <= 0 {
+	if state == nil || p == nil || p.Fainted || p.HP <= 0 || p.MaxHP <= 0 {
 		return
 	}
 	if normalizeTerrainID(state.Field.Terrain) != "grassyterrain" || !isGrounded(state, p) {
@@ -1257,7 +1425,7 @@ func applyTerrainResidual(state *BattleState, p *PokemonState) {
 }
 
 func applyAbilityResidual(state *BattleState, p *PokemonState) {
-	if state == nil || p == nil || p.Fainted || p.MaxHP <= 0 {
+	if state == nil || p == nil || p.Fainted || p.HP <= 0 || p.MaxHP <= 0 {
 		return
 	}
 	ability := normalizedName(p.Ability)
@@ -1279,6 +1447,232 @@ func applyAbilityResidual(state *BattleState, p *PokemonState) {
 		if p.Status != "" && randomChance(state, 33, 100) {
 			clearStatus(p)
 		}
+	}
+}
+
+func applyItemResidual(state *BattleState, p *PokemonState) {
+	if state == nil || p == nil || p.Fainted || p.HP <= 0 || p.MaxHP <= 0 {
+		return
+	}
+	item := normalizedName(p.Item)
+	if item == "leftovers" {
+		if p.HP < p.MaxHP {
+			heal := p.MaxHP / 16
+			if heal < 1 {
+				heal = 1
+			}
+			p.HP += heal
+			clampHP(p)
+		}
+	} else if item == "blacksludge" {
+		entry := gamedata.LookupSpecies(p.Species)
+		types := getCurrentTypes(p, entry)
+		if hasType(types, "Poison") {
+			if p.HP < p.MaxHP {
+				heal := p.MaxHP / 16
+				if heal < 1 {
+					heal = 1
+				}
+				p.HP += heal
+				clampHP(p)
+			}
+		} else {
+			dmg := p.MaxHP / 8
+			if dmg < 1 {
+				dmg = 1
+			}
+			p.HP -= dmg
+		}
+	}
+}
+
+func checkTypeResistBerry(p *PokemonState, moveType string) float64 {
+	if p == nil || p.Item == "" {
+		return 1.0
+	}
+	item := normalizedName(p.Item)
+	resisted := false
+	switch item {
+	case "occaberry":
+		resisted = moveType == "Fire"
+	case "passhoberry":
+		resisted = moveType == "Water"
+	case "wacanberry":
+		resisted = moveType == "Electric"
+	case "rindoberry":
+		resisted = moveType == "Grass"
+	case "yacheberry":
+		resisted = moveType == "Ice"
+	case "chopleberry":
+		resisted = moveType == "Fighting"
+	case "kebiaberry":
+		resisted = moveType == "Poison"
+	case "shucaberry":
+		resisted = moveType == "Ground"
+	case "cobaberry":
+		resisted = moveType == "Flying"
+	case "payapaberry":
+		resisted = moveType == "Psychic"
+	case "tangaberry":
+		resisted = moveType == "Bug"
+	case "chartiberry":
+		resisted = moveType == "Rock"
+	case "kasibberry":
+		resisted = moveType == "Ghost"
+	case "habanberry":
+		resisted = moveType == "Dragon"
+	case "colburberry":
+		resisted = moveType == "Dark"
+	case "babiriberry":
+		resisted = moveType == "Steel"
+	case "roselberry":
+		resisted = moveType == "Fairy"
+	}
+	if resisted {
+		p.Item = ""
+		return 0.5
+	}
+	return 1.0
+}
+
+func checkBerries(state *BattleState, p *PokemonState) {
+	if p == nil || p.Fainted || p.Item == "" {
+		return
+	}
+	item := normalizedName(p.Item)
+	consumed := false
+
+	switch item {
+	case "sitrusberry":
+		if p.HP <= p.MaxHP/2 {
+			p.HP += p.MaxHP / 4
+			clampHP(p)
+			consumed = true
+		}
+	case "oranberry":
+		if p.HP <= p.MaxHP/2 {
+			p.HP += 10
+			clampHP(p)
+			consumed = true
+		}
+	}
+
+	pinchHealing := []string{"aguavberry", "figyberry", "iapapaberry", "magoberry", "wikiberry"}
+	for _, b := range pinchHealing {
+		if item == b {
+			thresh := p.MaxHP / 4
+			if normalizedName(p.Ability) == "gluttony" {
+				thresh = p.MaxHP / 2
+			}
+			if p.HP <= thresh {
+				p.HP += p.MaxHP / 3
+				clampHP(p)
+				consumed = true
+			}
+		}
+	}
+
+	if item == "liechiberry" {
+		thresh := p.MaxHP / 4
+		if normalizedName(p.Ability) == "gluttony" {
+			thresh = p.MaxHP / 2
+		}
+		if p.HP <= thresh && p.GetBoost(AtkShift) < 6 {
+			p.SetBoost(AtkShift, p.GetBoost(AtkShift)+1)
+			consumed = true
+		}
+	} else if item == "ganlonberry" {
+		thresh := p.MaxHP / 4
+		if normalizedName(p.Ability) == "gluttony" {
+			thresh = p.MaxHP / 2
+		}
+		if p.HP <= thresh && p.GetBoost(DefShift) < 6 {
+			p.SetBoost(DefShift, p.GetBoost(DefShift)+1)
+			consumed = true
+		}
+	} else if item == "petayaberry" {
+		thresh := p.MaxHP / 4
+		if normalizedName(p.Ability) == "gluttony" {
+			thresh = p.MaxHP / 2
+		}
+		if p.HP <= thresh && p.GetBoost(SpaShift) < 6 {
+			p.SetBoost(SpaShift, p.GetBoost(SpaShift)+1)
+			consumed = true
+		}
+	} else if item == "apicotberry" {
+		thresh := p.MaxHP / 4
+		if normalizedName(p.Ability) == "gluttony" {
+			thresh = p.MaxHP / 2
+		}
+		if p.HP <= thresh && p.GetBoost(SpdShift) < 6 {
+			p.SetBoost(SpdShift, p.GetBoost(SpdShift)+1)
+			consumed = true
+		}
+	} else if item == "salacberry" {
+		thresh := p.MaxHP / 4
+		if normalizedName(p.Ability) == "gluttony" {
+			thresh = p.MaxHP / 2
+		}
+		if p.HP <= thresh && p.GetBoost(SpeShift) < 6 {
+			p.SetBoost(SpeShift, p.GetBoost(SpeShift)+1)
+			consumed = true
+		}
+	} else if item == "lumberry" {
+		if p.Status != "" || (p.Volatiles&VolatileConfusion) != 0 {
+			clearStatus(p)
+			p.ToggleVolatile(VolatileConfusion, false)
+			consumed = true
+		}
+	} else if item == "pechaberry" {
+		if p.Status == "psn" || p.Status == "tox" {
+			clearStatus(p)
+			consumed = true
+		}
+	} else if item == "rawstberry" {
+		if p.Status == "brn" {
+			clearStatus(p)
+			consumed = true
+		}
+	} else if item == "cheriberry" {
+		if p.Status == "par" {
+			clearStatus(p)
+			consumed = true
+		}
+	} else if item == "chestoberry" {
+		if p.Status == "slp" {
+			clearStatus(p)
+			consumed = true
+		}
+	} else if item == "aspearberry" {
+		if p.Status == "frz" {
+			clearStatus(p)
+			consumed = true
+		}
+	} else if item == "persimberry" {
+		if (p.Volatiles & VolatileConfusion) != 0 {
+			p.ToggleVolatile(VolatileConfusion, false)
+			consumed = true
+		}
+	} else if item == "keeberry" {
+		if p.TookDamageThisTurn && p.GetBoost(DefShift) < 6 {
+			p.SetBoost(DefShift, p.GetBoost(DefShift)+1)
+			consumed = true
+		}
+	} else if item == "marangaberry" {
+		if p.TookDamageThisTurn && p.GetBoost(SpdShift) < 6 {
+			p.SetBoost(SpdShift, p.GetBoost(SpdShift)+1)
+			consumed = true
+		}
+	} else if item == "enigmaberry" {
+		if p.TookDamageThisTurn {
+			p.HP += p.MaxHP / 4
+			clampHP(p)
+			consumed = true
+		}
+	}
+
+	if consumed {
+		p.Item = ""
 	}
 }
 
@@ -1312,6 +1706,30 @@ func decrementFieldTimers(field *FieldConditions) {
 	}
 }
 
+func decrementSideTimers(side *SideConditions) {
+	if side == nil {
+		return
+	}
+	if side.ReflectTurns > 0 {
+		side.ReflectTurns--
+	}
+	if side.LightScreenTurns > 0 {
+		side.LightScreenTurns--
+	}
+	if side.AuroraVeilTurns > 0 {
+		side.AuroraVeilTurns--
+	}
+	if side.TailwindTurns > 0 {
+		side.TailwindTurns--
+	}
+	if side.SafeguardTurns > 0 {
+		side.SafeguardTurns--
+	}
+	if side.MistTurns > 0 {
+		side.MistTurns--
+	}
+}
+
 func actionPriority(state *BattleState, player *PlayerState, action int) int {
 	if action >= ActionSwitchBase {
 		return 6
@@ -1341,6 +1759,12 @@ func actionPriority(state *BattleState, player *PlayerState, action int) int {
 	}
 	if normalizedName(active.Moves[moveIdx]) == "grassyglide" && normalizeTerrainID(state.Field.Terrain) == "grassyterrain" {
 		priority++
+	}
+	// Roar, Dragon Tail, etc. have -6 priority
+	if move.ForceSwitch && move.Category == "Status" {
+		priority = -6
+	} else if move.ForceSwitch && move.Category == "Physical" {
+		priority = -6
 	}
 	return priority
 }
@@ -1413,12 +1837,14 @@ func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
 
 	p1Queued := buildQueuedAction(state, &state.P1, &state.P2, p1Action, 1)
 	p2Queued := buildQueuedAction(state, &state.P2, &state.P1, p2Action, 2)
+	fmt.Printf("DEBUG: p1Queued: move=%v, switch=%v, action=%d\n", p1Queued.isMove, p1Queued.isSwitch, p1Queued.action)
+	fmt.Printf("DEBUG: p2Queued: move=%v, switch=%v, action=%d\n", p2Queued.isMove, p2Queued.isSwitch, p2Queued.action)
 
 	p1Flinched := false
 	p2Flinched := false
 	executeQueued := func(q queuedAction) {
 		if q.isSwitch {
-			if executeSwitchAction(q.player, q.action) {
+			if executeSwitchAction(state, q.player, q.action) {
 				applyOnSwitchInAbilities(state, q.player, q.opponent)
 			}
 			return
@@ -1451,6 +1877,14 @@ func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
 		}
 		attacker.ActedThisTurn = true
 		_, defenderFlinched := applyMoveDamage(state, q.player, q.opponent, moveIdx)
+
+		// Check berries for both right after damage
+		checkBerries(state, q.player.GetActive())
+		checkBerries(state, q.opponent.GetActive())
+
+		if moveID := normalizedName(attacker.Moves[moveIdx]); moveID != "" {
+			attacker.LockedMove = moveID
+		}
 		markActiveFainted(q.opponent)
 		if defenderFlinched && q.opponent.GetActive() != nil {
 			if q.playerNum == 1 {
@@ -1469,14 +1903,48 @@ func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
 		executeQueued(p1Queued)
 	}
 
-	applyStatusResidual(state.P1.GetActive())
-	applyStatusResidual(state.P2.GetActive())
-	applyWeatherResidual(state, state.P1.GetActive())
-	applyWeatherResidual(state, state.P2.GetActive())
-	applyTerrainResidual(state, state.P1.GetActive())
-	applyTerrainResidual(state, state.P2.GetActive())
-	applyAbilityResidual(state, state.P1.GetActive())
-	applyAbilityResidual(state, state.P2.GetActive())
+	// End of turn resolution in Speed order
+	act1 := state.P1.GetActive()
+	act2 := state.P2.GetActive()
+
+	p1Spe := 0.0
+	if act1 != nil {
+		p1Spe = getEffectiveStat(state, act1, SpeShift, &state.P1.Side, false)
+	}
+	p2Spe := 0.0
+	if act2 != nil {
+		p2Spe = getEffectiveStat(state, act2, SpeShift, &state.P2.Side, false)
+	}
+
+	type playerPair struct {
+		p   *PlayerState
+		opp *PlayerState
+	}
+	var order []playerPair
+	if p1Spe > p2Spe || (p1Spe == p2Spe && randomChance(state, 1, 2)) {
+		order = []playerPair{{&state.P1, &state.P2}, {&state.P2, &state.P1}}
+	} else {
+		order = []playerPair{{&state.P2, &state.P1}, {&state.P1, &state.P2}}
+	}
+
+	for _, pair := range order {
+		applyStatusResidual(pair.p.GetActive())
+	}
+	for _, pair := range order {
+		applyWeatherResidual(state, pair.p.GetActive())
+	}
+	for _, pair := range order {
+		applyTerrainResidual(state, pair.p.GetActive())
+	}
+	for _, pair := range order {
+		applyItemResidual(state, pair.p.GetActive())
+	}
+	for _, pair := range order {
+		applyAbilityResidual(state, pair.p.GetActive())
+	}
+	for _, pair := range order {
+		checkBerries(state, pair.p.GetActive())
+	}
 
 	if act := state.P1.GetActive(); act != nil {
 		act.TurnsActive++
@@ -1488,6 +1956,8 @@ func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
 	markActiveFainted(&state.P1)
 	markActiveFainted(&state.P2)
 	decrementFieldTimers(&state.Field)
+	decrementSideTimers(&state.P1.Side)
+	decrementSideTimers(&state.P2.Side)
 }
 
 func normalizedName(s string) string {
@@ -1587,7 +2057,7 @@ func getEffectiveStat(state *BattleState, p *PokemonState, shift uint32, side *S
 		if p.Status == "par" {
 			val *= 0.5
 		}
-		if side != nil && side.Tailwind {
+		if side != nil && side.TailwindTurns > 0 {
 			val *= 2.0
 		}
 		switch normalizedName(p.Ability) {
@@ -1684,7 +2154,25 @@ func moveHits(state *BattleState, attacker *PokemonState, defender *PokemonState
 	if baseAcc <= 0 {
 		return false
 	}
+
+	weather := ""
+	if state != nil {
+		weather = normalizeWeatherID(state.Field.Weather)
+	}
+	moveID := normalizedName(move.Name)
+	if (moveID == "thunder" || moveID == "hurricane") && weather == "raindance" {
+		return true
+	}
+	if moveID == "blizzard" && (weather == "snowscape" || weather == "hail") {
+		return true
+	}
+
 	acc := baseAcc * accuracyStageMultiplier(attacker.GetBoost(AccShift)) / accuracyStageMultiplier(defender.GetBoost(EvaShift))
+
+	if (moveID == "thunder" || moveID == "hurricane") && weather == "sunnyday" {
+		acc = 50.0
+	}
+
 	if acc <= 0 {
 		return false
 	}
@@ -1846,7 +2334,7 @@ func trySetStatus(state *BattleState, target *PokemonState, targetSide *SideCond
 	if status == "" || target.Status != "" {
 		return false
 	}
-	if targetSide != nil && targetSide.Safeguard {
+	if targetSide != nil && targetSide.SafeguardTurns > 0 {
 		return false
 	}
 
@@ -2168,6 +2656,14 @@ func switchToRandomBench(state *BattleState, player *PlayerState) bool {
 	if state == nil || player == nil {
 		return false
 	}
+	active := player.GetActive()
+	if active != nil {
+		ability := normalizedName(active.Ability)
+		if ability == "suctioncups" || (active.Volatiles&VolatileIngrain) != 0 {
+			return false
+		}
+	}
+
 	choices := 0
 	for i := 0; i < player.TeamSize; i++ {
 		if i != player.ActiveIdx && !player.Team[i].Fainted {
@@ -2183,7 +2679,20 @@ func switchToRandomBench(state *BattleState, player *PlayerState) bool {
 			continue
 		}
 		if choice == 0 {
-			return executeSwitchAction(player, ActionSwitchBase+i)
+			if executeSwitchAction(state, player, ActionSwitchBase+i) {
+				// Forced switches should trigger entry hazard effects and on-switch-in abilities
+				// Hazards are already applied in executeSwitchAction
+				// But we need to find the opponent for applyOnSwitchInAbilities
+				var opponent *PlayerState
+				if player == &state.P1 {
+					opponent = &state.P2
+				} else {
+					opponent = &state.P1
+				}
+				applyOnSwitchInAbilities(state, player, opponent)
+				return true
+			}
+			return false
 		}
 		choice--
 	}
@@ -2361,6 +2870,17 @@ func applyMoveDamage(state *BattleState, attackerPlayer *PlayerState, defenderPl
 		moveType = effectiveMoveType(state, attacker, moveID, moveEntry)
 		moveCategory = moveEntry.Category
 		movePriority = moveEntry.Priority
+
+		// Stance Change (Aegislash)
+		if normalizedName(attacker.Ability) == "stancechange" {
+			species := normalizedName(attacker.Species)
+			fmt.Printf("DEBUG: Stance Change trigger! Species: %s, Move: %s, Category: %s\n", species, moveID, moveCategory)
+			if (species == "aegislash" || species == "aegislashshield") && moveCategory != "Status" {
+				transformToForme(attacker, "aegislashblade")
+			} else if species == "aegislashblade" && moveID == "kingsshield" {
+				transformToForme(attacker, "aegislash")
+			}
+		}
 	}
 
 	if normalizeTerrainID(state.Field.Terrain) == "psychicterrain" && movePriority > 0 && isGrounded(state, defender) {
@@ -2625,9 +3145,9 @@ func applyMoveDamage(state *BattleState, attackerPlayer *PlayerState, defenderPl
 		}
 
 		if !critical {
-			if isPhysical && (defenderPlayer.Side.Reflect || defenderPlayer.Side.AuroraVeil) {
+			if isPhysical && (defenderPlayer.Side.ReflectTurns > 0 || defenderPlayer.Side.AuroraVeilTurns > 0) {
 				modifier *= 0.5
-			} else if !isPhysical && (defenderPlayer.Side.LightScreen || defenderPlayer.Side.AuroraVeil) {
+			} else if !isPhysical && (defenderPlayer.Side.LightScreenTurns > 0 || defenderPlayer.Side.AuroraVeilTurns > 0) {
 				modifier *= 0.5
 			}
 		}
@@ -2642,6 +3162,13 @@ func applyMoveDamage(state *BattleState, attackerPlayer *PlayerState, defenderPl
 			if normalizedName(attacker.Item) == "expertbelt" {
 				modifier *= 1.2
 			}
+			berryMod := checkTypeResistBerry(defender, moveType)
+			if berryMod < 1.0 {
+				modifier *= berryMod
+			}
+		} else if effectiveness == 1 && moveType == "Normal" && normalizedName(defender.Item) == "chilanberry" {
+			modifier *= 0.5
+			defender.Item = ""
 		}
 
 		if normalizedName(attacker.Item) == "lifeorb" {
@@ -2665,6 +3192,12 @@ func applyMoveDamage(state *BattleState, attackerPlayer *PlayerState, defenderPl
 		if finalDamage < 1 && modifier > 0 {
 			finalDamage = 1
 		}
+
+		if defender.HP == defender.MaxHP && finalDamage >= defender.HP && normalizedName(defender.Item) == "focussash" {
+			finalDamage = defender.HP - 1
+			defender.Item = ""
+		}
+
 		if finalDamage > defender.HP {
 			finalDamage = defender.HP
 		}
@@ -2674,12 +3207,30 @@ func applyMoveDamage(state *BattleState, attackerPlayer *PlayerState, defenderPl
 		}
 		totalDamage += finalDamage
 		clampHP(defender)
+
+		if moveEntry != nil && moveEntry.Flags["contact"] == 1 && normalizedName(defender.Item) == "rockyhelmet" && attacker.HP > 0 {
+			recoil := attacker.MaxHP / 6
+			if recoil < 1 {
+				recoil = 1
+			}
+			attacker.HP -= recoil
+		}
+
 		if defender.HP <= 0 {
 			break
 		}
 	}
 
 	flinch = applyMoveEffects(state, moveID, moveEntry, attackerPlayer, defenderPlayer, totalDamage)
+
+	if totalDamage > 0 && normalizedName(attacker.Item) == "shellbell" && attacker.HP > 0 {
+		heal := totalDamage / 8
+		if heal < 1 {
+			heal = 1
+		}
+		attacker.HP += heal
+	}
+
 	clampHP(attacker)
 	return true, flinch
 }
