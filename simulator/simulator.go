@@ -372,55 +372,9 @@ func parseConditionHP(cond string) (hp int, maxHP int, fainted bool, ok bool) {
 }
 
 // FastForwardToEvent reconstructs the state exactly up to (and including) the specified event index.
-func FastForwardToEvent(replay *parser.Replay, targetIndex int) (*BattleState, error) {
-	state := &BattleState{
-		Turn: 0,
-		P1: PlayerState{
-			ID:              "p1",
-			ActiveIdx:       -1,
-			CanTerastallize: true,
-		},
-		P2: PlayerState{
-			ID:              "p2",
-			ActiveIdx:       -1,
-			CanTerastallize: true,
-		},
-		RNGState: seedHash(replay.P1, replay.P2, strconv.Itoa(targetIndex)),
-	}
-
-	// 1. Initialize Teams from the replay
-	initPokemonArray(&state.P1, replay.Teams["p1"])
-	initPokemonArray(&state.P2, replay.Teams["p2"])
-
-	// Turn 0 initialization: Find the first switch for each player and make them active
-	for _, event := range replay.Events {
-		if event.Turn > 0 {
-			break
-		}
-		if event.Type == "switch" {
-			playerState := &state.P1
-			if event.Player == "p2" {
-				playerState = &state.P2
-			}
-			parts := strings.Split(event.Detail, " switched to ")
-			if len(parts) == 2 {
-				speciesName := event.Value
-				idx := findPokemonByName(playerState, speciesName)
-				if idx != -1 {
-					playerState.Team[idx].IsActive = true
-					playerState.ActiveIdx = idx
-				}
-			}
-		}
-	}
-
-	// 2. Process events sequentially up to targetIndex
-	for i, event := range replay.Events {
-		if i > targetIndex {
-			break
-		}
-
-		state.Turn = event.Turn
+// ApplyEvent applies a single parser.Event to the given BattleState.
+func ApplyEvent(state *BattleState, event parser.Event) {
+	state.Turn = event.Turn
 		playerState := &state.P1
 		if event.Player == "p2" {
 			playerState = &state.P2
@@ -706,6 +660,61 @@ func FastForwardToEvent(replay *parser.Replay, targetIndex int) (*BattleState, e
 				playerState.CanTerastallize = false
 			}
 		}
+}
+
+// UpdateRNGState updates the RNGState for a specific event index.
+func UpdateRNGState(state *BattleState, replay *parser.Replay, targetIndex int) {
+	state.RNGState = seedHash(replay.P1, replay.P2, strconv.Itoa(targetIndex))
+}
+func FastForwardToEvent(replay *parser.Replay, targetIndex int) (*BattleState, error) {
+	state := &BattleState{
+		Turn: 0,
+		P1: PlayerState{
+			ID:              "p1",
+			ActiveIdx:       -1,
+			CanTerastallize: true,
+		},
+		P2: PlayerState{
+			ID:              "p2",
+			ActiveIdx:       -1,
+			CanTerastallize: true,
+		},
+		RNGState: seedHash(replay.P1, replay.P2, strconv.Itoa(targetIndex)),
+	}
+
+	// 1. Initialize Teams from the replay
+	initPokemonArray(&state.P1, replay.Teams["p1"])
+	initPokemonArray(&state.P2, replay.Teams["p2"])
+
+	// Turn 0 initialization: Find the first switch for each player and make them active
+	for _, event := range replay.Events {
+		if event.Turn > 0 {
+			break
+		}
+		if event.Type == "switch" {
+			playerState := &state.P1
+			if event.Player == "p2" {
+				playerState = &state.P2
+			}
+			parts := strings.Split(event.Detail, " switched to ")
+			if len(parts) == 2 {
+				speciesName := event.Value
+				idx := findPokemonByName(playerState, speciesName)
+				if idx != -1 {
+					playerState.Team[idx].IsActive = true
+					playerState.ActiveIdx = idx
+				}
+			}
+		}
+	}
+
+	// 2. Process events sequentially up to targetIndex
+	for i, event := range replay.Events {
+		if i > targetIndex {
+			break
+		}
+
+		ApplyEvent(state, event)
 	}
 
 	return state, nil
