@@ -469,22 +469,22 @@ func vectorizeSideConditions(side *simulator.SideConditions, out *[TotalFeatures
 	if side.StickyWeb {
 		out[*idx+3] = 1.0
 	}
-	if side.Reflect {
+	if side.ReflectTurns > 0 {
 		out[*idx+4] = 1.0
 	}
-	if side.LightScreen {
+	if side.LightScreenTurns > 0 {
 		out[*idx+5] = 1.0
 	}
-	if side.AuroraVeil {
+	if side.AuroraVeilTurns > 0 {
 		out[*idx+6] = 1.0
 	}
-	if side.Tailwind {
+	if side.TailwindTurns > 0 {
 		out[*idx+7] = 1.0
 	}
-	if side.Safeguard {
+	if side.SafeguardTurns > 0 {
 		out[*idx+8] = 1.0
 	}
-	if side.Mist {
+	if side.MistTurns > 0 {
 		out[*idx+9] = 1.0
 	}
 	*idx += 10
