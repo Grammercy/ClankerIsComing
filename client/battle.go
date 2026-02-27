@@ -222,6 +222,9 @@ func buildPlayerState(pokemon []ShowdownPokemon, playerID string, currentPlayer 
 				if oldPoke.Species == ps.Species {
 					ps.Boosts = oldPoke.Boosts
 					ps.Volatiles = oldPoke.Volatiles
+					ps.SleepTurns = oldPoke.SleepTurns
+					ps.FreezeTurns = oldPoke.FreezeTurns
+					ps.ToxicCounter = oldPoke.ToxicCounter
 					if ps.TeraType == "" {
 						ps.TeraType = oldPoke.TeraType
 					}
