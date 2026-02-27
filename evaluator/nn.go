@@ -36,7 +36,7 @@ type MLP struct {
 
 // NewMLP initializes an MLP with the given layer sizes.
 func NewMLP(sizes []int) *MLP {
-	rand.Seed(time.Now().UnixNano())
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	mlp := &MLP{Layers: make([]*Layer, len(sizes)-1)}
 
 	for i := 0; i < len(sizes)-1; i++ {
@@ -60,7 +60,7 @@ func NewMLP(sizes []int) *MLP {
 			layer.WeightM[j] = make([]float64, inputSize)
 			layer.WeightV[j] = make([]float64, inputSize)
 			for k := 0; k < inputSize; k++ {
-				layer.Weights[j][k] = rand.NormFloat64() * variance
+				layer.Weights[j][k] = rng.NormFloat64() * variance
 			}
 		}
 		mlp.Layers[i] = layer
