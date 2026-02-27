@@ -1,15 +1,15 @@
 # Pokemon Engine AI
 
-A sophisticated high-performance AI bot and evaluation engine for Pokémon Showdown, written in Go. This project implements a fully functional offline battle simulator, deep-learning based position evaluation using Self-Attention, and alpha-beta search capabilities to find the optimal moves in dynamic game states.
+A sophisticated high-performance AI bot and evaluation engine for Pokémon Showdown, written in Go. This project implements a fully functional offline battle simulator, deep-learning based position evaluation using Self-Attention, and Monte Carlo Tree Search (MCTS) capabilities to find the optimal moves in dynamic game states.
 
 ## 🌟 Overview
 
-This engine provides a full pipeline from data gathering (scraping and parsing Showdown replays), off-line reinforcement learning and NN training, deep search evaluation (Alpha-Beta pruning), to a live bot instance capable of connecting to Pokemon Showdown and playing matches autonomously.
+This engine provides a full pipeline from data gathering (scraping and parsing Showdown replays), off-line reinforcement learning and NN training, deep search evaluation (MCTS), to a live bot instance capable of connecting to Pokemon Showdown and playing matches autonomously.
 
 ### Core Features
 - **Live Bot Client:** Connects to Pokemon Showdown websocket, parses live game streams, and computes/sends moves asynchronously within time budgets.
 - **Deep Learning Evaluator:** Neural Network evaluator architecture utilizing Self-Attention layers and multi-layer perceptrons (MLPs). Capable of predicting win probabilities using OpenCL-accelerated hardware.
-- **Alpha-Beta Search Engine:** Explores future action paths and utilizes transposition tables, move ordering, and alpha-beta pruning to drastically improve finding optimal moves.
+- **MCTS Search Engine:** Explores future action paths using Monte Carlo Tree Search, leveraging neural network evaluations to iteratively build a search tree and find optimal moves.
 - **Full Battle Simulator:** Accurately models Pokémon stats, field conditions, move damages, type effectiveness, and dynamic mechanics (e.g., Terastallization).
 - **Self-Play & Offline Training:** Features commands to parse existing replays, generate tagged evaluation states, train models via gradient descent (Adam optimizer), and perform self-play to iteratively improve model strength.
 
@@ -40,7 +40,7 @@ graph TD
     end
 
     subgraph "bot/"
-        Search[Alpha-Beta Search Engine]:::module
+        Search[MCTS Search Engine]:::module
         TT[Transposition Table]:::module
     end
 
@@ -68,23 +68,20 @@ The client manages the WebSocket connection to Pokemon Showdown, handles authent
 
 A high-performance offline engine. Because the main Showdown simulator relies heavily on JavaScript, this project rewrites the core battle flow and state definition in Go. It determines legally possible switches and moves, including checking for edge cases, move-aware damage, and correctly simulating fast-forward states.
 
-### 3. Alpha-Beta Search Engine (`bot/`)
+### 3. MCTS Search Engine (`bot/`)
 
-The bot navigates a game tree of possible actions using Alpha-Beta pruning to find the optimal move.
+The bot navigates a game tree of possible actions using Monte Carlo Tree Search to find the optimal move.
 
 ```mermaid
 flowchart TD
-    Root(Current Game State) --> M1{Action: Move 1}
-    Root --> M2{Action: Switch}
-    
-    M1 --> O1[Opponent Action 1]
-    M1 --> O2[Opponent Action 2]
-    
-    O1 --> Eval[Evaluate Position: Neural Net]
-    O2 --> Prune[Prune Branch]
+    Root(Current State) -->|Select| Node1(Action 1)
+    Root -->|Select| Node2(Action 2)
+    Node1 -->|Expand & Evaluate| NN[Neural Net Prediction]
+    NN -->|Backpropagate| Node1
+    Node1 -->|Update Stats| Root
 ```
 
-To achieve high Nodes Per Second (NPS), the search heavily utilizes transposition tables to cache previously visited states and avoid redundant computation.
+The search algorithm iteratively runs simulations, balancing exploration of new moves and exploitation of promising variations guided by the neural network's evaluations.
 
 ### 4. Neural Network Evaluator (`evaluator/`)
 
@@ -119,7 +116,7 @@ Connects to Showdown and begins accepting random battle challenges.
 * **`scrape`**: Download replays from Pokemon Showdown. ` -format gen9randombattle -num 100`
 * **`parse`**: Extract structured data from raw log files.
 * **`evaluate`**: Predict win probability at a specific turn from a replay.
-* **`search-evaluate`**: Run deep Alpha-Beta search on a replay turn.
+* **`search-evaluate`**: Run deep MCTS search on a replay turn.
 
 ### Training & Self-Play
 The training pipeline requires replay data:
