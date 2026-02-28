@@ -1,7 +1,6 @@
 package simulator
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -1837,8 +1836,8 @@ func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
 
 	p1Queued := buildQueuedAction(state, &state.P1, &state.P2, p1Action, 1)
 	p2Queued := buildQueuedAction(state, &state.P2, &state.P1, p2Action, 2)
-	fmt.Printf("DEBUG: p1Queued: move=%v, switch=%v, action=%d\n", p1Queued.isMove, p1Queued.isSwitch, p1Queued.action)
-	fmt.Printf("DEBUG: p2Queued: move=%v, switch=%v, action=%d\n", p2Queued.isMove, p2Queued.isSwitch, p2Queued.action)
+	// fmt.Printf("DEBUG: p1Queued: move=%v, switch=%v, action=%d\n", p1Queued.isMove, p1Queued.isSwitch, p1Queued.action)
+	// fmt.Printf("DEBUG: p2Queued: move=%v, switch=%v, action=%d\n", p2Queued.isMove, p2Queued.isSwitch, p2Queued.action)
 
 	p1Flinched := false
 	p2Flinched := false
@@ -2874,7 +2873,7 @@ func applyMoveDamage(state *BattleState, attackerPlayer *PlayerState, defenderPl
 		// Stance Change (Aegislash)
 		if normalizedName(attacker.Ability) == "stancechange" {
 			species := normalizedName(attacker.Species)
-			fmt.Printf("DEBUG: Stance Change trigger! Species: %s, Move: %s, Category: %s\n", species, moveID, moveCategory)
+			// fmt.Printf("DEBUG: Stance Change trigger! Species: %s, Move: %s, Category: %s\n", species, moveID, moveCategory)
 			if (species == "aegislash" || species == "aegislashshield") && moveCategory != "Status" {
 				transformToForme(attacker, "aegislashblade")
 			} else if species == "aegislashblade" && moveID == "kingsshield" {

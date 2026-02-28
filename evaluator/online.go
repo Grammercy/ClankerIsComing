@@ -59,7 +59,7 @@ func OnlineLearn(experiences []ExperienceTuple, reward float64) {
 	}
 
 	// Apply accumulated gradients using Adam
-	mlp.ApplyAdamGradients(nil, float64(len(experiences)), learningRate, 0.9, 0.999, 1e-8)
+	mlp.ApplyAdamGradients(nil, float64(len(experiences)), learningRate, 0.0001, 0.9, 0.999, 1e-8)
 
 	avgLoss := totalLoss / float64(len(experiences))
 	fmt.Printf("[OnlineLearn] Trained on %d experiences (reward=%.1f, avg_loss=%.6f)\n",

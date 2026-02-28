@@ -22,6 +22,7 @@ import (
 const BatchSize = 256
 const defaultKernelBatchSize = 64
 const kernelTuneIterations = 8
+const WeightDecay = 0.0001
 
 // TrainingState preserves progress across restarts
 type TrainingState struct {
@@ -571,8 +572,8 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 
 		workerBatchCount += n
 		for workerBatchCount >= BatchSize {
-			mlp.ApplyAdamGradients(nil, float64(BatchSize), learningRate, 0.9, 0.999, 1e-8)
-			attentionMLP.ApplyAdamGradients(nil, float64(BatchSize), learningRate, 0.9, 0.999, 1e-8)
+			mlp.ApplyAdamGradients(nil, float64(BatchSize), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
+			attentionMLP.ApplyAdamGradients(nil, float64(BatchSize), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
 			workerBatchCount -= BatchSize
 		}
 		batch = batch[:0]
@@ -587,8 +588,8 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 	flushKernelBatch()
 
 	if workerBatchCount > 0 {
-		mlp.ApplyAdamGradients(nil, float64(workerBatchCount), learningRate, 0.9, 0.999, 1e-8)
-		attentionMLP.ApplyAdamGradients(nil, float64(workerBatchCount), learningRate, 0.9, 0.999, 1e-8)
+		mlp.ApplyAdamGradients(nil, float64(workerBatchCount), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
+		attentionMLP.ApplyAdamGradients(nil, float64(workerBatchCount), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
 	}
 	return stats
 }
@@ -605,8 +606,8 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		return err
 	}
 
-	fmt.Printf("Initializing Main MLP [%d -> 2048 -> 1024 -> 512 -> %d]...\n", TotalFeatures, simulator.MaxActions)
-	mlp := NewMLP([]int{TotalFeatures, 2048, 1024, 512, simulator.MaxActions})
+	fmt.Printf("Initializing Main MLP [%d -> 1024 -> 512 -> 256 -> %d]...\n", TotalFeatures, simulator.MaxActions)
+	mlp := NewMLP([]int{TotalFeatures, 1024, 512, 256, simulator.MaxActions})
 	if err := mlp.LoadWeights("evaluator_weights.json"); err == nil {
 		fmt.Println("Loaded existing evaluator_weights.json...")
 	} else {

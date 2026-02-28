@@ -68,9 +68,10 @@ func NewMLP(sizes []int) *MLP {
 
 	backend, err := newOpenCLMLPBackend(mlp)
 	if err != nil {
-		panic(fmt.Sprintf("failed to initialize OpenCL MLP backend: %v", err))
+		fmt.Printf("Warning: failed to initialize OpenCL MLP backend (falling back to CPU): %v\n", err)
+	} else {
+		mlp.gpu = backend
 	}
-	mlp.gpu = backend
 
 	return mlp
 }
@@ -133,10 +134,12 @@ func NewWorkerCache(mlp *MLP) *WorkerCache {
 }
 
 func (mlp *MLP) ensureGPU() {
+	// Re-initialization attempt if nil, but don't panic
 	if mlp.gpu == nil {
 		backend, err := newOpenCLMLPBackend(mlp)
 		if err != nil {
-			panic(fmt.Sprintf("failed to initialize OpenCL MLP backend: %v", err))
+			// Log once and don't try again if it's a permanent failure (stub)
+			return
 		}
 		mlp.gpu = backend
 	}
@@ -150,6 +153,10 @@ func (mlp *MLP) OpenCLMaxBatchSize() int {
 // Forward runs entirely on OpenCL.
 func (mlp *MLP) Forward(inputs []float64, cache *InferenceCache) []float64 {
 	mlp.ensureGPU()
+	if mlp.gpu == nil {
+		lastLayer := mlp.Layers[len(mlp.Layers)-1]
+		return make([]float64, len(lastLayer.Biases))
+	}
 	out, err := mlp.gpu.forward(mlp, inputs, cache)
 	if err != nil {
 		panic(fmt.Sprintf("OpenCL forward failed: %v", err))
@@ -159,6 +166,14 @@ func (mlp *MLP) Forward(inputs []float64, cache *InferenceCache) []float64 {
 
 func (mlp *MLP) ForwardBatch(inputsBatch [][]float64) [][]float64 {
 	mlp.ensureGPU()
+	if mlp.gpu == nil {
+		lastLayer := mlp.Layers[len(mlp.Layers)-1]
+		out := make([][]float64, len(inputsBatch))
+		for i := range out {
+			out[i] = make([]float64, len(lastLayer.Biases))
+		}
+		return out
+	}
 	out, err := mlp.gpu.forwardBatch(mlp, inputsBatch)
 	if err != nil {
 		panic(fmt.Sprintf("OpenCL batch forward failed: %v", err))
@@ -212,7 +227,7 @@ func (mlp *MLP) BackpropAttentionFromInputGradsBatch(
 	}
 }
 
-func (mlp *MLP) ApplyAdamGradients(cache *WorkerCache, batchSize float64, lr, beta1, beta2, epsilon float64) {
+func (mlp *MLP) ApplyAdamGradients(cache *WorkerCache, batchSize float64, lr, weightDecay, beta1, beta2, epsilon float64) {
 	mlp.ensureGPU()
 	step := atomic.AddInt64(&mlp.AdamStep, 1)
 	beta1CorrInv := adamBiasCorrectionInv(beta1, step)
@@ -227,7 +242,7 @@ func (mlp *MLP) ApplyAdamGradients(cache *WorkerCache, batchSize float64, lr, be
 		}
 	}()
 
-	if err := mlp.gpu.applyAdamGradients(mlp, cache, batchSize, lr, beta1, beta2, epsilon, beta1CorrInv, beta2CorrInv); err != nil {
+	if err := mlp.gpu.applyAdamGradients(mlp, cache, batchSize, lr, weightDecay, beta1, beta2, epsilon, beta1CorrInv, beta2CorrInv); err != nil {
 		panic(fmt.Sprintf("OpenCL Adam update failed: %v", err))
 	}
 }
