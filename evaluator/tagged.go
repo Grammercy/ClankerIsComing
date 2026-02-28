@@ -9,12 +9,13 @@ import (
 const TaggedReplayVersion = 1
 
 type TaggedSample struct {
-	Prefix    []float64 `json:"prefix"`
-	RawSlots  []float64 `json:"rawSlots"`
-	Targets   []float64 `json:"targets"`
-	EloWeight float64   `json:"eloWeight"`
-	Turn      int       `json:"turn,omitempty"`
-	EventIdx  int       `json:"eventIdx,omitempty"`
+	Prefix      []float64 `json:"prefix"`
+	RawSlots    []float64 `json:"rawSlots"`
+	Targets     []float64 `json:"targets"`
+	EloWeight   float64   `json:"eloWeight"`
+	Turn        int       `json:"turn,omitempty"`
+	EventIdx    int       `json:"eventIdx,omitempty"`
+	IsSearchTag bool      `json:"isSearchTag,omitempty"`
 }
 
 type TaggedReplayDataset struct {
@@ -24,7 +25,7 @@ type TaggedReplayDataset struct {
 	Samples      []TaggedSample `json:"samples"`
 }
 
-func BuildTaggedSampleFromState(state *simulator.BattleState, targets []float64, eloWeight float64) (TaggedSample, string, bool) {
+func BuildTaggedSampleFromState(state *simulator.BattleState, targets []float64, eloWeight float64, isSearchTag bool) (TaggedSample, string, bool) {
 	if len(targets) != simulator.MaxActions {
 		return TaggedSample{}, "target_length_mismatch", false
 	}
@@ -65,10 +66,11 @@ func BuildTaggedSampleFromState(state *simulator.BattleState, targets []float64,
 	vectorizeMatchup(state, &prefixArr, &idx)
 
 	return TaggedSample{
-		Prefix:    append([]float64(nil), prefixArr[:TotalGlobals]...),
-		RawSlots:  rawSlots,
-		Targets:   append([]float64(nil), targets...),
-		EloWeight: eloWeight,
+		Prefix:      append([]float64(nil), prefixArr[:TotalGlobals]...),
+		RawSlots:    rawSlots,
+		Targets:     append([]float64(nil), targets...),
+		EloWeight:   eloWeight,
+		IsSearchTag: isSearchTag,
 	}, "", true
 }
 
@@ -83,9 +85,11 @@ func taggedSampleToPrepared(sample TaggedSample) (preparedSnapshot, error) {
 		return preparedSnapshot{}, fmt.Errorf("invalid targets length %d (expected %d)", len(sample.Targets), simulator.MaxActions)
 	}
 	return preparedSnapshot{
-		prefix:    append([]float64(nil), sample.Prefix...),
-		rawSlots:  append([]float64(nil), sample.RawSlots...),
-		targets:   append([]float64(nil), sample.Targets...),
-		eloWeight: sample.EloWeight,
+		prefix:      append([]float64(nil), sample.Prefix...),
+		rawSlots:    append([]float64(nil), sample.RawSlots...),
+		targets:     append([]float64(nil), sample.Targets...),
+		eloWeight:   sample.EloWeight,
+		isSearchTag: sample.IsSearchTag,
+		turn:        sample.Turn,
 	}, nil
 }

@@ -88,7 +88,11 @@ func bceLoss(target, output float64) float64 {
 	if output > 1.0-epsilon {
 		output = 1.0 - epsilon
 	}
-	return -(target*math.Log(output) + (1.0-target)*math.Log(1.0-output))
+	loss := -(target*math.Log(output) + (1.0-target)*math.Log(1.0-output))
+	if math.IsNaN(loss) || math.IsInf(loss, 0) {
+		return 0
+	}
+	return loss
 }
 
 // Caches
