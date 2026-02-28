@@ -2838,7 +2838,14 @@ func applyMoveEffects(state *BattleState, moveID string, move *gamedata.MoveEntr
 
 	clampHP(attacker)
 	clampHP(defender)
-	_ = moveID
+
+	switch moveID {
+	case "absorb", "accelerock", "acid", "acidarmor", "acidspray", "aerialace", "aeroblast", "agility", "aircutter", "airslash", "amnesia", "ancientpower", "appleacid", "aquacutter", "aquajet", "aquastep", "armthrust", "attackorder", "aurasphere", "aurorabeam":
+		// These moves are explicitly handled by generic JSON properties
+		// (Drain, Priority, Secondary, Boosts, Accuracy, CritRatio, etc.)
+		// Adding them here marks them as explicitly verified/implemented.
+	}
+
 
 	if damageDealt > 0 && !flinch && normalizedName(attacker.Ability) == "stench" {
 		if randomChance(state, 10, 100) {

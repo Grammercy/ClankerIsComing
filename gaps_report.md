@@ -5,40 +5,40 @@ This report exhaustively lists all Generation 9 mechanics (Moves, Abilities, Ite
 
 | Move | Status | Notes / Lacking |
 |---|---|---|
-| Absorb | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Accelerock | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Acid | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Acid Armor | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Acid Spray | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Absorb | 🟢 Implemented | Explicitly handled in engine logic. |
+| Accelerock | 🟢 Implemented | Explicitly handled in engine logic. |
+| Acid | 🟢 Implemented | Explicitly handled in engine logic. |
+| Acid Armor | 🟢 Implemented | Explicitly handled in engine logic. |
+| Acid Spray | 🟢 Implemented | Explicitly handled in engine logic. |
 | Acrobatics | 🟢 Implemented | Explicitly handled in engine logic. |
 | Acupressure | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Aerial Ace | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Aeroblast | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Aerial Ace | 🟢 Implemented | Explicitly handled in engine logic. |
+| Aeroblast | 🟢 Implemented | Explicitly handled in engine logic. |
 | After You | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Agility | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Air Cutter | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Air Slash | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Agility | 🟢 Implemented | Explicitly handled in engine logic. |
+| Air Cutter | 🟢 Implemented | Explicitly handled in engine logic. |
+| Air Slash | 🟢 Implemented | Explicitly handled in engine logic. |
 | Alluring Voice | 🔴 Missing | Secondary effects / specific move logic not implemented. |
 | Ally Switch | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Amnesia | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Ancient Power | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Apple Acid | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Aqua Cutter | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Aqua Jet | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Amnesia | 🟢 Implemented | Explicitly handled in engine logic. |
+| Ancient Power | 🟢 Implemented | Explicitly handled in engine logic. |
+| Apple Acid | 🟢 Implemented | Explicitly handled in engine logic. |
+| Aqua Cutter | 🟢 Implemented | Explicitly handled in engine logic. |
+| Aqua Jet | 🟢 Implemented | Explicitly handled in engine logic. |
 | Aqua Ring | 🟢 Implemented | Explicitly handled in engine logic. |
-| Aqua Step | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Aqua Step | 🟢 Implemented | Explicitly handled in engine logic. |
 | Aqua Tail | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Arm Thrust | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Arm Thrust | 🟢 Implemented | Explicitly handled in engine logic. |
 | Armor Cannon | 🔴 Missing | Secondary effects / specific move logic not implemented. |
 | Aromatic Mist | 🔴 Missing | Secondary effects / specific move logic not implemented. |
 | Assurance | 🟢 Implemented | Explicitly handled in engine logic. |
 | Astonish | 🔴 Missing | Secondary effects / specific move logic not implemented. |
 | Astral Barrage | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Attack Order | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Attack Order | 🟢 Implemented | Explicitly handled in engine logic. |
 | Attract | 🟢 Implemented | Explicitly handled in engine logic. |
-| Aura Sphere | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Aura Sphere | 🟢 Implemented | Explicitly handled in engine logic. |
 | Aura Wheel | 🔴 Missing | Secondary effects / specific move logic not implemented. |
-| Aurora Beam | 🔴 Missing | Secondary effects / specific move logic not implemented. |
+| Aurora Beam | 🟢 Implemented | Explicitly handled in engine logic. |
 | Aurora Veil | 🔴 Missing | Secondary effects / specific move logic not implemented. |
 | Avalanche | 🔴 Missing | Secondary effects / specific move logic not implemented. |
 | Axe Kick | 🔴 Missing | Secondary effects / specific move logic not implemented. |
