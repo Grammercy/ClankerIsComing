@@ -194,8 +194,30 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		jobs := make(chan os.DirEntry, len(epochEntries))
 		samples := make(chan preparedSnapshot, kernelBatchSize*8)
 		statsCh := make(chan gpuEpochStats, 1)
+		progressCh := make(chan gpuEpochStats, 1)
+
 		go func() {
-			statsCh <- runGPUEpochTrainer(mlp, attentionMLP, kernelBatchSize, learningRate, samples)
+			lastReport := time.Now()
+			for s := range progressCh {
+				if time.Since(lastReport) < 2*time.Second {
+					continue
+				}
+				avgLoss := 0.0
+				if s.validSnapshots > 0 {
+					avgLoss = s.totalLoss / float64(s.validSnapshots)
+				}
+				elapsed := time.Since(epochStart)
+				rate := float64(s.validSnapshots) / elapsed.Seconds()
+				fmt.Printf("\r  -> Progress: %d snapshots | Avg Loss: %.6f | Speed: %.0f/s        ",
+					s.validSnapshots, avgLoss, rate)
+				lastReport = time.Now()
+			}
+		}()
+
+		go func() {
+			stats := runGPUEpochTrainer(mlp, attentionMLP, kernelBatchSize, learningRate, samples, progressCh)
+			close(progressCh)
+			statsCh <- stats
 		}()
 
 		var workerWG sync.WaitGroup
@@ -227,6 +249,10 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 					local.filesLoaded++
 
 					for _, tagged := range dataset.Samples {
+						if !tagged.IsSearchTag && tagged.Turn <= 10 {
+							local.samplesSkipped++
+							continue
+						}
 						prepared, err := taggedSampleToPrepared(tagged)
 						if err != nil {
 							local.samplesSkipped++
@@ -249,8 +275,10 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		close(jobs)
 		workerWG.Wait()
 		close(samples)
+		workerWG.Wait()
 
 		stats := <-statsCh
+		fmt.Printf("\n") // Clear progress line
 		fmt.Printf("Epoch %d Tagged Data - files: %d loaded, %d failed, samples: %d loaded, %d skipped\n",
 			epoch,
 			loadStats.filesLoaded,

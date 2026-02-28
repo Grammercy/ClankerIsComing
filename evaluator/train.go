@@ -23,6 +23,7 @@ const BatchSize = 256
 const defaultKernelBatchSize = 64
 const kernelTuneIterations = 8
 const WeightDecay = 0.0001
+const TrainingTurnThreshold = 20
 
 // TrainingState preserves progress across restarts
 type TrainingState struct {
@@ -190,10 +191,12 @@ func tuneKernelBatchSize(mlp *MLP, attentionMLP *MLP) int {
 }
 
 type preparedSnapshot struct {
-	prefix    []float64
-	rawSlots  []float64
-	targets   []float64
-	eloWeight float64
+	prefix      []float64
+	rawSlots    []float64
+	targets     []float64
+	eloWeight   float64
+	isSearchTag bool
+	turn        int
 }
 
 type gpuEpochStats struct {
@@ -395,7 +398,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 	samples := make([]preparedSnapshot, 0, len(replay.Events)/2)
 
 	for i, event := range replay.Events {
-		if event.Player != "p1" {
+		if event.Player != "p1" || event.Turn < TrainingTurnThreshold {
 			continue
 		}
 
@@ -486,7 +489,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 	return samples, stats
 }
 
-func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learningRate float64, samples <-chan preparedSnapshot) gpuEpochStats {
+func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learningRate float64, samples <-chan preparedSnapshot, progressCh chan<- gpuEpochStats) gpuEpochStats {
 	stats := gpuEpochStats{}
 	workerBatchCount := 0
 	batch := make([]preparedSnapshot, 0, kernelBatchSize)
@@ -577,6 +580,13 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 			workerBatchCount -= BatchSize
 		}
 		batch = batch[:0]
+
+		if stats.validSnapshots%65536 == 0 {
+			select {
+			case progressCh <- stats:
+			default:
+			}
+		}
 	}
 
 	for sample := range samples {
@@ -661,8 +671,33 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		jobs := make(chan os.DirEntry, len(epochEntries))
 		samples := make(chan preparedSnapshot, kernelBatchSize*8)
 		statsCh := make(chan gpuEpochStats, 1)
+		progressCh := make(chan gpuEpochStats, 1)
+
 		go func() {
-			statsCh <- runGPUEpochTrainer(mlp, attentionMLP, kernelBatchSize, learningRate, samples)
+			lastReport := time.Now()
+			for s := range progressCh {
+				if time.Since(lastReport) < 2*time.Second {
+					continue
+				}
+				avgLoss := 0.0
+				if s.validSnapshots > 0 {
+					avgLoss = s.totalLoss / float64(s.validSnapshots)
+				}
+				if math.IsNaN(avgLoss) || math.IsInf(avgLoss, 0) {
+					avgLoss = 0.0
+				}
+				elapsed := time.Since(epochStart)
+				rate := float64(s.validSnapshots) / elapsed.Seconds()
+				fmt.Printf("\r  -> Progress: %d snapshots | Avg Loss: %.6f | Speed: %.0f/s        ",
+					s.validSnapshots, avgLoss, rate)
+				lastReport = time.Now()
+			}
+		}()
+
+		go func() {
+			stats := runGPUEpochTrainer(mlp, attentionMLP, kernelBatchSize, learningRate, samples, progressCh)
+			close(progressCh)
+			statsCh <- stats
 		}()
 
 		var parserWG sync.WaitGroup
@@ -722,8 +757,10 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		close(jobs)
 		parserWG.Wait()
 		close(samples)
+		parserWG.Wait()
 
 		stats := <-statsCh
+		fmt.Printf("\n") // Clear progress line
 		coverage := 0.0
 		if labelStats.candidates > 0 {
 			coverage = 100.0 * float64(labelStats.mapped) / float64(labelStats.candidates)

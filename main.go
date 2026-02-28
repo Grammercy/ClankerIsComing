@@ -1038,40 +1038,57 @@ func runMixedTrainCommand(inDir string, taggedDir string, testDir string, search
 				targets[i] = -1.0
 			}
 
-			if rng.Float64() >= searchRatio {
+			isSearchTag := rng.Float64() < searchRatio
+			if !isSearchTag && replay.Events[eventIdx].Turn <= 10 {
 				skippedPositions++
 				continue
 			}
 
-			detailedTags := bot.GetDetailedTagsWithBudget(state, searchDepth, baseSims, mlpCache, attentionCache, tt)
-			_, margin := topTwoSearchScores(validActions, validLen, detailedTags)
-			isUncertain := margin <= hardMargin
-			isLateGame := totalAliveInState(state) <= 4
-			retagByLateGame := isLateGame && hardRatio > 0 && rng.Float64() < hardRatio
-			shouldHardRetag := hardSims > 0 && (isUncertain || retagByLateGame)
-			if shouldHardRetag {
-				retagDepth := hardDepth
-				if retagDepth == 0 {
-					retagDepth = searchDepth + 1
+			if isSearchTag {
+				detailedTags := bot.GetDetailedTagsWithBudget(state, searchDepth, baseSims, mlpCache, attentionCache, tt)
+				_, margin := topTwoSearchScores(validActions, validLen, detailedTags)
+				isUncertain := margin <= hardMargin
+				isLateGame := totalAliveInState(state) <= 4
+				retagByLateGame := isLateGame && hardRatio > 0 && rng.Float64() < hardRatio
+				shouldHardRetag := hardSims > 0 && (isUncertain || retagByLateGame)
+				if shouldHardRetag {
+					retagDepth := hardDepth
+					if retagDepth == 0 {
+						retagDepth = searchDepth + 1
+					}
+					detailedTags = bot.GetDetailedTagsWithBudget(state, retagDepth, hardSims, mlpCache, attentionCache, tt)
+					hardRetags++
+					if isUncertain {
+						hardRetagsUncertain++
+					}
+					if retagByLateGame {
+						hardRetagsLateGame++
+					}
 				}
-				detailedTags = bot.GetDetailedTagsWithBudget(state, retagDepth, hardSims, mlpCache, attentionCache, tt)
-				hardRetags++
-				if isUncertain {
-					hardRetagsUncertain++
+				for i := 0; i < validLen; i++ {
+					action := validActions[i]
+					if action >= 0 && action < simulator.MaxActions {
+						targets[action] = detailedTags[action]
+					}
 				}
-				if retagByLateGame {
-					hardRetagsLateGame++
+				searchLabels++
+			} else {
+				// Replay label (non-tagged)
+				matchWinner := 0.5
+				if strings.EqualFold(replay.Winner, replay.P1) {
+					matchWinner = 1.0
+				} else if strings.EqualFold(replay.Winner, replay.P2) {
+					matchWinner = 0.0
 				}
+				chosenAction, ok := mapReplayEventChosenAction(replay, state, eventIdx)
+				if !ok || chosenAction < 0 || chosenAction >= simulator.MaxActions {
+					skippedPositions++
+					continue
+				}
+				targets[chosenAction] = matchWinner
 			}
-			for i := 0; i < validLen; i++ {
-				action := validActions[i]
-				if action >= 0 && action < simulator.MaxActions {
-					targets[action] = detailedTags[action]
-				}
-			}
-			searchLabels++
 
-			tagged, _, ok := evaluator.BuildTaggedSampleFromState(state, targets, eloWeight)
+			tagged, _, ok := evaluator.BuildTaggedSampleFromState(state, targets, eloWeight, isSearchTag)
 			if !ok {
 				skippedPositions++
 				continue
@@ -1261,7 +1278,7 @@ func runTagReplaysCommand(inDir string, taggedDir string, searchDepth int) error
 				}
 			}
 
-			tagged, _, ok := evaluator.BuildTaggedSampleFromState(state, targets, eloWeight)
+			tagged, _, ok := evaluator.BuildTaggedSampleFromState(state, targets, eloWeight, true)
 			if !ok {
 				skippedPositions++
 				continue

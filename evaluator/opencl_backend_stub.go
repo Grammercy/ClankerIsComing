@@ -48,7 +48,7 @@ func (b *openclMLPBackend) backpropAttentionFromInputGradsBatch(_ *MLP, _ [][]fl
 	return fmt.Errorf("OpenCL backend unavailable in non-opencl build")
 }
 
-func (b *openclMLPBackend) applyAdamGradients(_ *MLP, _ *WorkerCache, _ float64, _, _, _, _ float64, _, _ float64) error {
+func (b *openclMLPBackend) applyAdamGradients(_ *MLP, _ *WorkerCache, _ float64, _, _, _, _, _ float64, _, _ float64) error {
 	return fmt.Errorf("OpenCL backend unavailable in non-opencl build")
 }
 
