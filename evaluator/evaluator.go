@@ -9,11 +9,11 @@ import (
 )
 
 // FeaturesPerSlot is the number of features extracted per Pokemon slot
-// 74 base + (24 per move * 4 moves) = 170
-const FeaturesPerSlot = 170
+// 53 base + (6 per move * 4 moves) + 3 padding = 80
+const FeaturesPerSlot = 80
 
-// TotalSlotFeatures is 12 slots * 170 features
-const TotalSlotFeatures = 12 * FeaturesPerSlot // 2040
+// TotalSlotFeatures is 12 slots * 80 features
+const TotalSlotFeatures = 12 * FeaturesPerSlot // 960
 
 // FieldFeatures = 5 weather one-hot + 5 terrain one-hot + 1 trick room + 1 gravity = 12
 const FieldFeatures = 12
@@ -31,7 +31,7 @@ const MatchupFeatures = 2
 const TotalGlobals = 6 + FieldFeatures + 2*SideFeatures + BoostFeatures + MatchupFeatures // 50
 
 // TotalFeatures is globals + slot features
-const TotalFeatures = TotalGlobals + TotalSlotFeatures // 2090
+const TotalFeatures = TotalGlobals + TotalSlotFeatures // 1010
 
 var (
 	GlobalMLP          *MLP
@@ -63,7 +63,7 @@ func HashFeatures(f *[TotalFeatures]float64) uint64 {
 
 func InitEvaluator() {
 	if !MLPLoadAttempted {
-		GlobalMLP = NewMLP([]int{TotalFeatures, 2048, 1024, 512, simulator.MaxActions})
+		GlobalMLP = NewMLP([]int{TotalFeatures, 1024, 512, 256, simulator.MaxActions})
 		GlobalAttentionMLP = NewMLP([]int{TotalSlotFeatures, 256, 128, 12})
 		GlobalAttentionMLP.LinearOutput = true
 
@@ -607,6 +607,8 @@ func vectorizePlayerFeatures(player *simulator.PlayerState, state *simulator.Bat
 // extractPokemon is a helper to vectorize a single Pokemon into the slots array.
 // Now includes Move-Action features for all 4 move slots.
 func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int, state *simulator.BattleState) {
+	startOffset := *slotsIdx
+
 	isAlive := 0.0
 	if !poke.Fainted {
 		isAlive = 1.0
@@ -627,31 +629,26 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 		}
 	}
 
-	brn, par, slp, psn := 0.0, 0.0, 0.0, 0.0
-	switch poke.Status {
-	case "brn":
-		brn = 1.0
-	case "par":
-		par = 1.0
-	case "slp", "frz":
-		slp = 1.0
-	case "psn", "tox":
-		psn = 1.0
-	}
-
 	slots[*slotsIdx] = isAlive
 	*slotsIdx++
 	slots[*slotsIdx] = isActive
 	*slotsIdx++
 	slots[*slotsIdx] = hpPct
 	*slotsIdx++
-	slots[*slotsIdx] = brn
-	*slotsIdx++
-	slots[*slotsIdx] = par
-	*slotsIdx++
-	slots[*slotsIdx] = slp
-	*slotsIdx++
-	slots[*slotsIdx] = psn
+
+	// Status (1 float)
+	statusVal := 0.0
+	switch poke.Status {
+	case "brn":
+		statusVal = 0.25
+	case "par":
+		statusVal = 0.5
+	case "slp", "frz":
+		statusVal = 0.75
+	case "psn", "tox":
+		statusVal = 1.0
+	}
+	slots[*slotsIdx] = statusVal
 	*slotsIdx++
 
 	// Level (normalized)
@@ -662,16 +659,14 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 	slots[*slotsIdx] = lvl / 100.0
 	*slotsIdx++
 
-	// Gender (2 bits: IsMale, IsFemale)
-	isMale, isFemale := 0.0, 0.0
+	// Gender (1 float: M=1, F=0.5, N=0)
+	genderVal := 0.0
 	if poke.Gender == "M" {
-		isMale = 1.0
+		genderVal = 1.0
 	} else if poke.Gender == "F" {
-		isFemale = 1.0
+		genderVal = 0.5
 	}
-	slots[*slotsIdx] = isMale
-	*slotsIdx++
-	slots[*slotsIdx] = isFemale
+	slots[*slotsIdx] = genderVal
 	*slotsIdx++
 
 	slots[*slotsIdx] = float64(poke.NumMoves) / 4.0
@@ -705,15 +700,15 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 		*slotsIdx++
 	}
 
-	// Volatiles (18 bits)
+	// Volatiles (1 bitpacked float)
+	vPacked := 0.0
 	for i := 0; i < 18; i++ {
 		if (poke.Volatiles & (1 << uint32(i))) != 0 {
-			slots[*slotsIdx] = 1.0
-		} else {
-			slots[*slotsIdx] = 0.0
+			vPacked += math.Pow(2, float64(i))
 		}
-		*slotsIdx++
 	}
+	slots[*slotsIdx] = vPacked / 262144.0 // 2^18
+	*slotsIdx++
 
 	entry := gamedata.LookupSpecies(poke.Species)
 	if entry != nil {
@@ -762,8 +757,7 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 		}
 	}
 
-	// MOVE-ACTION FEATURES (24 per move * 4 moves = 96)
-	// We determine opponent active to calculate effectiveness
+	// MOVE-ACTION FEATURES
 	var opponentActive *simulator.PokemonState
 	if state != nil {
 		if poke.IsActive {
@@ -780,26 +774,19 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 		moveName := poke.Moves[m]
 		move := gamedata.LookupMove(moveName)
 		if move != nil {
-			// 1. Type One-Hot (18)
-			typeVec := gamedata.TypeOneHot([]string{move.Type})
-			for i := 0; i < 18; i++ {
-				slots[*slotsIdx] = typeVec[i]
-				*slotsIdx++
-			}
-			// 2. Category (3: Phys, Spec, Stat)
-			p, s, st := 0.0, 0.0, 0.0
+			// 1. Type ID (normalized) (1)
+			typeIdx := gamedata.GetTypeIndex(move.Type)
+			slots[*slotsIdx] = float64(typeIdx) / 18.0
+			*slotsIdx++
+
+			// 2. Category (1: Phys=1, Spec=0.5, Stat=0)
+			cat := 0.0
 			if move.Category == "Physical" {
-				p = 1.0
+				cat = 1.0
 			} else if move.Category == "Special" {
-				s = 1.0
-			} else {
-				st = 1.0
+				cat = 0.5
 			}
-			slots[*slotsIdx] = p
-			*slotsIdx++
-			slots[*slotsIdx] = s
-			*slotsIdx++
-			slots[*slotsIdx] = st
+			slots[*slotsIdx] = cat
 			*slotsIdx++
 
 			// 3. Base Power (1)
@@ -827,12 +814,23 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 			}
 			slots[*slotsIdx] = eff
 			*slotsIdx++
+
+			// 6. Extra Padding for alignment
+			slots[*slotsIdx] = 0.0
+			*slotsIdx++
 		} else {
-			// Zero pad empty move slots
-			for i := 0; i < 24; i++ {
+			// Zero pad empty move slots (6 features)
+			for i := 0; i < 6; i++ {
 				slots[*slotsIdx] = 0.0
 				*slotsIdx++
 			}
 		}
+	}
+
+	// Final Padding to reach FeaturesPerSlot (80 total)
+	expectedEnd := startOffset + FeaturesPerSlot
+	for *slotsIdx < expectedEnd {
+		slots[*slotsIdx] = 0.0
+		*slotsIdx++
 	}
 }

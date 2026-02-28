@@ -38,6 +38,7 @@ func main() {
 	// Train command flags
 	epochs := flag.Int("epochs", 10, "Number of training iterations over the dataset")
 	depth := flag.Int("depth", 2, "Search depth for Alpha-Beta engine (search-evaluate command)")
+	sims := flag.Int("sims", 0, "MCTS simulation count (0 = use depth-based default)")
 	taggedDir := flag.String("tagged", "data/tagged", "Directory for tagged data output/input (tag/train-tagged commands)")
 	testDir := flag.String("test", "data/test", "Directory containing held-out replay logs for validation")
 	mixSearchRatio := flag.Float64("mix-search-ratio", 0.3, "Fraction of positions labeled with search in mixed-train mode")
@@ -127,7 +128,7 @@ func main() {
 		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
 			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
 		}
-		err := runEvaluateBulkCommand(*inDir, *turn)
+		err := runEvaluateBulkCommand(*inDir, *turn, *depth, *sims)
 		if err != nil {
 			fmt.Printf("Bulk Evaluation failed: %v\n", err)
 			os.Exit(1)
@@ -166,7 +167,7 @@ func main() {
 		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
 			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
 		}
-		err := runSearchEvaluateBulkCommand(*inDir, *turn, *depth)
+		err := runSearchEvaluateBulkCommand(*inDir, *turn, *depth, *sims)
 		if err != nil {
 			fmt.Printf("Search evaluation failed: %v\n", err)
 			os.Exit(1)
@@ -449,14 +450,14 @@ func runEvaluateCommand(filePath string, targetTurn int) error {
 	return nil
 }
 
-func runEvaluateBulkCommand(inDir string, targetTurn int) error {
-	fmt.Printf("Starting bulk evaluation on directory: %s at Turn %d\n", inDir, targetTurn)
+func runEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int, sims int) error {
+	fmt.Printf("Starting bulk evaluation on directory: %s at Turn %d (Depth: %d, Sims: %d)\n", inDir, targetTurn, searchDepth, sims)
 	entries, err := os.ReadDir(inDir)
 	if err != nil {
 		return fmt.Errorf("could not read directory: %w", err)
 	}
 
-	// Shuffle and sample 2000 random games
+	// Shuffle and sample random games for benchmark
 	rand.Shuffle(len(entries), func(i, j int) { entries[i], entries[j] = entries[j], entries[i] })
 	maxSample := 10000
 	if len(entries) > maxSample {
@@ -470,6 +471,11 @@ func runEvaluateBulkCommand(inDir string, targetTurn int) error {
 	startTime := time.Now()
 
 	numWorkers := 16
+	if searchDepth > 0 {
+		// Reduce workers if searching to avoid massive overhead, but keep batching for rollout evals
+		numWorkers = 8
+	}
+
 	jobs := make(chan string, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
@@ -478,6 +484,11 @@ func runEvaluateBulkCommand(inDir string, targetTurn int) error {
 		jobs <- fmt.Sprintf("%s/%s", inDir, entry.Name())
 	}
 	close(jobs)
+
+	// If depth is 0, we can use the high-performance batching evaluator
+	if searchDepth <= 0 {
+		return runBatchEvaluateBulk(jobs, len(entries), targetTurn, &totalFiles, &correctPredictions, startTime)
+	}
 
 	var wg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
@@ -499,7 +510,6 @@ func runEvaluateBulkCommand(inDir string, targetTurn int) error {
 					}
 					evalTurn = rand.Intn(replay.Turns-2) + 2
 				} else if targetTurn < 0 {
-					// Negative turn = N turns from the end (e.g. -5 = 5 turns before end)
 					evalTurn = replay.Turns + targetTurn
 					if evalTurn < 1 {
 						continue
@@ -515,11 +525,10 @@ func runEvaluateBulkCommand(inDir string, targetTurn int) error {
 
 				tf := atomic.AddInt32(&totalFiles, 1)
 
-				// Use Alpha-Beta search instead of raw NN evaluation (for tiebreaking default but Evaluate directly is faster)
-				winProb, nodes := bot.SearchEvaluate(state, 1, mlpCache, attentionCache, tt)
+				// Use SearchEvaluate with specified depth and sims
+				winProb, nodes := bot.SearchEvaluateWithSims(state, searchDepth, sims, mlpCache, attentionCache, tt)
 				atomic.AddInt64(&totalNodes, int64(nodes))
 
-				// Map Winner string back to p1/p2
 				actualWinner := "tie"
 				if replay.Winner == replay.P1 {
 					actualWinner = "p1"
@@ -539,13 +548,120 @@ func runEvaluateBulkCommand(inDir string, targetTurn int) error {
 				}
 
 				if tf%1000 == 0 {
-					fmt.Printf("...Evaluated %d matches...\n", tf)
+					fmt.Printf("\r...Evaluated %d matches...", tf)
 				}
 			}
 		}()
 	}
 	wg.Wait()
 
+	printBulkReport(totalFiles, correctPredictions, totalNodes, startTime, targetTurn)
+	return nil
+}
+
+func runBatchEvaluateBulk(jobs <-chan string, estimatedTotal int, targetTurn int, totalFiles *int32, correctPredictions *int32, startTime time.Time) error {
+	numWorkers := 16
+	stateChan := make(chan struct {
+		state  simulator.BattleState
+		winner string
+	}, 1024)
+
+	var wg sync.WaitGroup
+	// Workers to parse and fast-forward states
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for filePath := range jobs {
+				replay, err := parser.ParseLogFile(filePath)
+				if err != nil {
+					continue
+				}
+
+				evalTurn := targetTurn
+				if targetTurn == 0 {
+					if replay.Turns < 5 {
+						continue
+					}
+					evalTurn = rand.Intn(replay.Turns-2) + 2
+				} else if targetTurn < 0 {
+					evalTurn = replay.Turns + targetTurn
+					if evalTurn < 1 {
+						continue
+					}
+				} else if replay.Turns < targetTurn {
+					continue
+				}
+
+				state, err := simulator.FastForward(replay, evalTurn)
+				if err != nil {
+					continue
+				}
+
+				actualWinner := "tie"
+				if replay.Winner == replay.P1 {
+					actualWinner = "p1"
+				} else if replay.Winner == replay.P2 {
+					actualWinner = "p2"
+				}
+
+				stateChan <- struct {
+					state  simulator.BattleState
+					winner string
+				}{*state, actualWinner}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(stateChan)
+	}()
+
+	// Batch consumer
+	batchSize := 256
+	var states []simulator.BattleState
+	var winners []string
+
+	for item := range stateChan {
+		states = append(states, item.state)
+		winners = append(winners, item.winner)
+
+		if len(states) >= batchSize {
+			processBatch(states, winners, totalFiles, correctPredictions)
+			states = states[:0]
+			winners = winners[:0]
+			fmt.Printf("\r...Evaluated %d matches...", atomic.LoadInt32(totalFiles))
+		}
+	}
+
+	if len(states) > 0 {
+		processBatch(states, winners, totalFiles, correctPredictions)
+	}
+
+	printBulkReport(*totalFiles, *correctPredictions, 0, startTime, targetTurn)
+	return nil
+}
+
+func processBatch(states []simulator.BattleState, winners []string, totalFiles *int32, correctPredictions *int32) {
+	evals := evaluator.EvaluateBatchStates(states)
+	for i, winProb := range evals {
+		actualWinner := winners[i]
+		predictedWinner := "tie"
+		if winProb > 0.5 {
+			predictedWinner = "p1"
+		} else if winProb < 0.5 {
+			predictedWinner = "p2"
+		}
+
+		if predictedWinner == actualWinner {
+			atomic.AddInt32(correctPredictions, 1)
+		}
+		atomic.AddInt32(totalFiles, 1)
+	}
+}
+
+func printBulkReport(totalFiles int32, correctPredictions int32, totalNodes int64, startTime time.Time, targetTurn int) {
 	fmt.Printf("\n--- Bulk Prediction Report ---\n")
 	if targetTurn == 0 {
 		fmt.Printf("Total Valid Replays (Random Midgame Turns): %d\n", totalFiles)
@@ -556,18 +672,18 @@ func runEvaluateBulkCommand(inDir string, targetTurn int) error {
 	if totalFiles > 0 {
 		accuracy := float64(correctPredictions) / float64(totalFiles) * 100.0
 		elapsed := time.Since(startTime).Seconds()
-		nps := float64(totalNodes) / elapsed
-
 		fmt.Printf("Correct Predictions: %d (%.2f%% Accuracy)\n", correctPredictions, accuracy)
-		fmt.Printf("Time Elapsed: %.2f seconds\n", elapsed)
-		fmt.Printf("Nodes Evaluated: %d\n", totalNodes)
-		fmt.Printf("Nodes Per Second (NPS): %.0f\n", nps)
+		fmt.Printf("Time Elapsed: %.2f seconds (%.1f replays/sec)\n", elapsed, float64(totalFiles)/elapsed)
+		if totalNodes > 0 {
+			nps := float64(totalNodes) / elapsed
+			fmt.Printf("Nodes Evaluated: %d\n", totalNodes)
+			fmt.Printf("Nodes Per Second (NPS): %.0f\n", nps)
+		}
 	}
-	return nil
 }
 
-func runSearchEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int) error {
-	fmt.Printf("Starting search-enhanced bulk evaluation (depth=%d) on directory: %s at Turn %d\n", searchDepth, inDir, targetTurn)
+func runSearchEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int, sims int) error {
+	fmt.Printf("Starting search-enhanced bulk evaluation (depth=%d, sims=%d) on directory: %s at Turn %d\n", searchDepth, sims, inDir, targetTurn)
 	entries, err := os.ReadDir(inDir)
 	if err != nil {
 		return fmt.Errorf("could not read directory: %w", err)
@@ -626,8 +742,8 @@ func runSearchEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int)
 
 				tf := atomic.AddInt32(&totalFiles, 1)
 
-				// Use Alpha-Beta search instead of raw NN evaluation
-				winProb, nodes := bot.SearchEvaluate(state, searchDepth, mlpCache, attentionCache, tt)
+				// Use SearchEvaluate with specified depth and sims
+				winProb, nodes := bot.SearchEvaluateWithSims(state, searchDepth, sims, mlpCache, attentionCache, tt)
 				atomic.AddInt64(&totalNodes, int64(nodes))
 
 				actualWinner := "tie"
@@ -648,9 +764,9 @@ func runSearchEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int)
 					atomic.AddInt32(&correctPredictions, 1)
 				}
 
-				if tf%100 == 0 {
+				if tf%1000 == 0 {
 					accuracy := float64(atomic.LoadInt32(&correctPredictions)) / float64(tf) * 100.0
-					fmt.Printf("...Evaluated %d matches (%.2f%% accuracy so far)...\n", tf, accuracy)
+					fmt.Printf("\r...Evaluated %d matches (%.2f%% accuracy so far)...", tf, accuracy)
 				}
 			}
 		}()
@@ -984,12 +1100,15 @@ func runMixedTrainCommand(inDir string, taggedDir string, testDir string, search
 
 		taggedCount++
 		totalPositions += len(taggedSamples)
-		elapsed := time.Since(start)
-		avgPerLog := elapsed / time.Duration(processedLogs)
-		remaining := avgPerLog * time.Duration(totalLogFiles-processedLogs)
-		fmt.Printf("Mixed-tagged %s -> %s (%d positions) [Progress %d/%d | Elapsed %s | ETA %s]\n",
-			entry.Name(), outPath, len(taggedSamples), processedLogs, totalLogFiles, formatDurationCompact(elapsed), formatDurationCompact(remaining))
+		if processedLogs%100 == 0 || processedLogs == totalLogFiles {
+			elapsed := time.Since(start)
+			avgPerLog := elapsed / time.Duration(processedLogs)
+			remaining := avgPerLog * time.Duration(totalLogFiles-processedLogs)
+			fmt.Printf("\rMixed-tagging Progress: %d/%d logs | %d positions | Elapsed %s | ETA %s",
+				processedLogs, totalLogFiles, totalPositions, formatDurationCompact(elapsed), formatDurationCompact(remaining))
+		}
 	}
+	fmt.Println()
 
 	fmt.Printf("Mixed label generation complete: %d/%d replays written, %d positions tagged, %d positions skipped\n", taggedCount, replayCount, totalPositions, skippedPositions)
 	fmt.Printf("Label counts: search=%d (sampled ratio realized: %.2f%%)\n", searchLabels, 100.0*float64(searchLabels)/math.Max(1.0, float64(searchLabels+skippedPositions)))
@@ -1171,8 +1290,11 @@ func runTagReplaysCommand(inDir string, taggedDir string, searchDepth int) error
 
 		taggedCount++
 		totalPositions += len(taggedSamples)
-		fmt.Printf("Tagged %s -> %s (%d positions)\n", entry.Name(), outPath, len(taggedSamples))
+		if taggedCount%10 == 0 {
+			fmt.Printf("\rTagged %d replays (%d positions)...", taggedCount, totalPositions)
+		}
 	}
+	fmt.Println()
 
 	fmt.Printf("Tagging complete: %d/%d replays written, %d positions tagged, %d positions skipped\n",
 		taggedCount, replayCount, totalPositions, skippedPositions)

@@ -139,6 +139,7 @@ __kernel void adam_update(
     const float beta1CorrInv,
     const float beta2CorrInv,
     const float lr,
+    const float weightDecay,
     const float epsilon,
     const float invBatch
 ) {
@@ -151,7 +152,7 @@ __kernel void adam_update(
 
     m[gid] = mNew;
     v[gid] = vNew;
-    params[gid] += lr * (mNew * beta1CorrInv) / (sqrt(vNew * beta2CorrInv) + epsilon);
+    params[gid] = params[gid] * (1.0f - weightDecay) + lr * (mNew * beta1CorrInv) / (sqrt(vNew * beta2CorrInv) + epsilon);
     grads[gid] = 0.0f;
 }
 
@@ -1958,7 +1959,7 @@ func (b *openclMLPBackend) backpropAttentionFromInputGradsBatch(
 	return nil
 }
 
-func (b *openclMLPBackend) applyAdamGradients(mlp *MLP, _ *WorkerCache, batchSize float64, lr, beta1, beta2, epsilon float64, beta1CorrInv, beta2CorrInv float64) error {
+func (b *openclMLPBackend) applyAdamGradients(mlp *MLP, _ *WorkerCache, batchSize float64, lr, weightDecay, beta1, beta2, epsilon float64, beta1CorrInv, beta2CorrInv float64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -1980,6 +1981,7 @@ func (b *openclMLPBackend) applyAdamGradients(mlp *MLP, _ *WorkerCache, batchSiz
 			float32(beta1CorrInv),
 			float32(beta2CorrInv),
 			float32(lr),
+			float32(weightDecay),
 			float32(epsilon),
 			invBatch,
 		); err != nil {
@@ -2000,6 +2002,7 @@ func (b *openclMLPBackend) applyAdamGradients(mlp *MLP, _ *WorkerCache, batchSiz
 			float32(beta1CorrInv),
 			float32(beta2CorrInv),
 			float32(lr),
+			float32(weightDecay),
 			float32(epsilon),
 			invBatch,
 		); err != nil {

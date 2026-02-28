@@ -39,20 +39,24 @@ type searchContext struct {
 }
 
 type mctsActionStat struct {
-	visits   int
-	valueSum float64
+	visits      int
+	virtualLoss int
+	valueSum    float64
 }
 
 type mctsNode struct {
-	mu         sync.Mutex
-	visits     int
-	actionStat map[int]*mctsActionStat
-	children   map[int]*mctsNode
+	mu           sync.Mutex
+	visits       int
+	virtualLoss  int
+	p1ActionStat map[int]*mctsActionStat
+	p2ActionStat map[int]*mctsActionStat
+	children     map[int]*mctsNode
 }
 
 type mctsPathStep struct {
 	node   *mctsNode
-	action int
+	p1Hero int
+	p2Hero int
 }
 
 type mctsConfig struct {
@@ -457,9 +461,13 @@ func defaultMCTSConfig(rolloutDepth int) mctsConfig {
 		rolloutDepth = 1
 	}
 
-	simulations := rolloutDepth * 4096
-	if simulations < 4096 {
-		simulations = 4096
+	// Previously rolloutDepth * 4096, which was too heavy for low depths.
+	// Now we use a more progressive scale.
+	simulations := 256
+	if rolloutDepth == 2 {
+		simulations = 1024
+	} else if rolloutDepth >= 3 {
+		simulations = rolloutDepth * 1024
 	}
 	if v, ok := parsePositiveIntEnv("MCTS_SIMS"); ok {
 		simulations = v
@@ -509,36 +517,55 @@ func terminalValue(state *simulator.BattleState) (float64, bool) {
 	return 0, false
 }
 
-func ensureNodeActions(node *mctsNode, p1Actions [simulator.MaxActions]int, p1Len int) {
-	if node.actionStat != nil {
+func ensureNodeActions(node *mctsNode, p1Actions [simulator.MaxActions]int, p1Len int, p2Actions [simulator.MaxActions]int, p2Len int) {
+	if node.p1ActionStat != nil {
 		return
 	}
-	node.actionStat = make(map[int]*mctsActionStat, p1Len)
+	node.p1ActionStat = make(map[int]*mctsActionStat, p1Len)
 	for i := 0; i < p1Len; i++ {
-		a := p1Actions[i]
-		node.actionStat[a] = &mctsActionStat{}
+		node.p1ActionStat[p1Actions[i]] = &mctsActionStat{}
+	}
+	node.p2ActionStat = make(map[int]*mctsActionStat, p2Len)
+	for i := 0; i < p2Len; i++ {
+		node.p2ActionStat[p2Actions[i]] = &mctsActionStat{}
 	}
 	if node.children == nil {
 		node.children = make(map[int]*mctsNode)
 	}
 }
 
-func selectUCTAction(node *mctsNode, p1Actions [simulator.MaxActions]int, p1Len int, exploreC float64, rng *rand.Rand) int {
-	// Small random tie-breaker keeps workers de-correlated.
-	bestAction := p1Actions[rng.Intn(p1Len)]
+func selectUCTAction(stats map[int]*mctsActionStat, actions [simulator.MaxActions]int, n int, totalVisits int, exploreC float64, rng *rand.Rand, maximize bool) int {
+	bestAction := actions[rng.Intn(n)]
 	bestScore := -math.MaxFloat64
-	logVisits := math.Log(float64(node.visits + 1))
-	for i := 0; i < p1Len; i++ {
-		action := p1Actions[i]
-		stat := node.actionStat[action]
-		if stat == nil || stat.visits == 0 {
+	if !maximize {
+		bestScore = math.MaxFloat64
+	}
+
+	logVisits := math.Log(float64(totalVisits + 1))
+	for i := 0; i < n; i++ {
+		action := actions[i]
+		stat := stats[action]
+		if stat == nil || (stat.visits+stat.virtualLoss) == 0 {
 			return action
 		}
-		mean := stat.valueSum / float64(stat.visits)
-		ucb := mean + exploreC*math.Sqrt(logVisits/float64(stat.visits))
-		if ucb > bestScore {
-			bestScore = ucb
-			bestAction = action
+
+		v := stat.visits + stat.virtualLoss
+		mean := stat.valueSum / float64(stat.visits) // Note: valueSum is only from real visits
+		if !maximize {
+			mean = 1.0 - mean
+		}
+
+		ucb := mean + exploreC*math.Sqrt(logVisits/float64(v))
+		if maximize {
+			if ucb > bestScore {
+				bestScore = ucb
+				bestAction = action
+			}
+		} else {
+			if ucb < bestScore {
+				bestScore = ucb
+				bestAction = action
+			}
 		}
 	}
 	return bestAction
@@ -558,44 +585,46 @@ func runMCTSSimulation(root *mctsNode, rootState simulator.BattleState, cfg mcts
 	path := make([]mctsPathStep, 0, cfg.rolloutDepth)
 	steps := 0
 
+	// Exploration phase
 	for depth := 0; depth < cfg.rolloutDepth; depth++ {
-		if v, terminal := terminalValue(&state); terminal {
-			for _, step := range path {
-				step.node.mu.Lock()
-				step.node.visits++
-				stat := step.node.actionStat[step.action]
-				if stat == nil {
-					stat = &mctsActionStat{}
-					step.node.actionStat[step.action] = stat
-				}
-				stat.visits++
-				stat.valueSum += v
-				step.node.mu.Unlock()
-			}
-			return steps + 1
+		if _, terminal := terminalValue(&state); terminal {
+			break
 		}
-
 		if ctx != nil && ctx.useDeadline && time.Now().After(ctx.deadline) {
 			ctx.timedOut = true
 			break
 		}
 
 		p1Actions, p1Len := simulator.GetSearchActions(&state.P1)
+		p2Actions, p2Len := simulator.GetSearchActions(&state.P2)
 		if p1Len == 0 {
-			break
+			p1Actions[0] = -1
+			p1Len = 1
+		}
+		if p2Len == 0 {
+			p2Actions[0] = -1
+			p2Len = 1
 		}
 
 		node.mu.Lock()
-		ensureNodeActions(node, p1Actions, p1Len)
-		p1Action := selectUCTAction(node, p1Actions, p1Len, cfg.exploreC, rng)
-		p2Action := chooseOpponentAction(&state, rng)
+		ensureNodeActions(node, p1Actions, p1Len, p2Actions, p2Len)
+
+		totalV := node.visits + node.virtualLoss
+		p1Action := selectUCTAction(node.p1ActionStat, p1Actions, p1Len, totalV, cfg.exploreC, rng, true)
+		p2Action := selectUCTAction(node.p2ActionStat, p2Actions, p2Len, totalV, cfg.exploreC, rng, false)
+
+		// Apply Virtual Loss
+		node.virtualLoss++
+		node.p1ActionStat[p1Action].virtualLoss++
+		node.p2ActionStat[p2Action].virtualLoss++
+
 		jointKey := encodeJointAction(p1Action, p2Action)
 		child := node.children[jointKey]
 		if child == nil {
 			child = &mctsNode{}
 			node.children[jointKey] = child
 		}
-		path = append(path, mctsPathStep{node: node, action: p1Action})
+		path = append(path, mctsPathStep{node: node, p1Hero: p1Action, p2Hero: p2Action})
 		node.mu.Unlock()
 
 		next := state
@@ -606,18 +635,30 @@ func runMCTSSimulation(root *mctsNode, rootState simulator.BattleState, cfg mcts
 	}
 
 	value := batcher.Evaluate(state)
-	for _, step := range path {
+	if v, terminal := terminalValue(&state); terminal {
+		value = v
+	}
+
+	// Backpropagation phase
+	for i := len(path) - 1; i >= 0; i-- {
+		step := path[i]
 		step.node.mu.Lock()
+		step.node.virtualLoss--
 		step.node.visits++
-		stat := step.node.actionStat[step.action]
-		if stat == nil {
-			stat = &mctsActionStat{}
-			step.node.actionStat[step.action] = stat
-		}
-		stat.visits++
-		stat.valueSum += value
+
+		p1Stat := step.node.p1ActionStat[step.p1Hero]
+		p1Stat.virtualLoss--
+		p1Stat.visits++
+		p1Stat.valueSum += value
+
+		p2Stat := step.node.p2ActionStat[step.p2Hero]
+		p2Stat.virtualLoss--
+		p2Stat.visits++
+		p2Stat.valueSum += value // Both track value from P1 perspective
+
 		step.node.mu.Unlock()
 	}
+
 	return steps + 1
 }
 
@@ -673,8 +714,8 @@ func runMCTSSearch(state *simulator.BattleState, cfg mctsConfig, mlpCache *evalu
 	for i := 0; i < p1Len; i++ {
 		action := p1Actions[i]
 		score := baseEval
-		if root.actionStat != nil {
-			if stat := root.actionStat[action]; stat != nil && stat.visits > 0 {
+		if root.p1ActionStat != nil {
+			if stat := root.p1ActionStat[action]; stat != nil && stat.visits > 0 {
 				score = stat.valueSum / float64(stat.visits)
 			}
 		}
@@ -702,7 +743,14 @@ func runMCTSSearch(state *simulator.BattleState, cfg mctsConfig, mlpCache *evalu
 
 // SearchBestMove runs parallel MCTS and returns the best P1 action.
 func SearchBestMove(state *simulator.BattleState, depth int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) SearchResult {
+	return SearchBestMoveWithSims(state, depth, 0, mlpCache, attentionCache, tt)
+}
+
+func SearchBestMoveWithSims(state *simulator.BattleState, depth int, sims int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) SearchResult {
 	cfg := defaultMCTSConfig(depth)
+	if sims > 0 {
+		cfg.simulations = sims
+	}
 	return runMCTSSearch(state, cfg, mlpCache, attentionCache, tt, nil)
 }
 
@@ -733,11 +781,15 @@ func IterativeDeepeningSearch(state *simulator.BattleState, maxDuration time.Dur
 // SearchEvaluate uses MCTS at a given rollout depth to evaluate who is winning.
 // Returns the score from P1's perspective (>0.5 = P1 favored), and the number of nodes searched.
 func SearchEvaluate(state *simulator.BattleState, depth int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) (float64, int) {
+	return SearchEvaluateWithSims(state, depth, 0, mlpCache, attentionCache, tt)
+}
+
+func SearchEvaluateWithSims(state *simulator.BattleState, depth int, sims int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) (float64, int) {
 	if depth <= 0 {
 		score := evaluator.Evaluate(state, -1, evaluator.GlobalMLP, evaluator.GlobalAttentionMLP, mlpCache, attentionCache, tt)
 		return score, 1
 	}
-	result := SearchBestMove(state, depth, mlpCache, attentionCache, tt)
+	result := SearchBestMoveWithSims(state, depth, sims, mlpCache, attentionCache, tt)
 	return result.Score, result.NodesSearched
 }
 
