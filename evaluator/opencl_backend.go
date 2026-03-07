@@ -17,11 +17,14 @@ const mlpOpenCLSource = `
 __kernel void dense_forward(
     __global const float* weights,
     __global const float* biases,
+    __global const float* bnMean,
+    __global const float* bnVar,
     __global const float* in,
     __global float* out,
     const int inSize,
     const int outSize,
-    const int activation
+    const int activation,
+    const int useBatchNorm
 ) {
     int gid = get_global_id(0);
     if (gid >= outSize) return;
@@ -30,6 +33,10 @@ __kernel void dense_forward(
     int base = gid * inSize;
     for (int i = 0; i < inSize; i++) {
         sum += weights[base + i] * in[i];
+    }
+
+    if (useBatchNorm != 0) {
+        sum = (sum - bnMean[gid]) * rsqrt(bnVar[gid] + 1.0e-5f);
     }
 
     if (activation == 0) {
@@ -81,10 +88,12 @@ __kernel void set_output_deltas(
 __kernel void hidden_delta(
     __global const float* nextWeights,
     __global const float* nextDeltas,
+    __global const float* bnVar,
     __global const float* currentOutputs,
     __global float* currentDeltas,
     const int currentSize,
-    const int nextSize
+    const int nextSize,
+    const int useBatchNorm
 ) {
     int gid = get_global_id(0);
     if (gid >= currentSize) return;
@@ -96,7 +105,11 @@ __kernel void hidden_delta(
 
     float o = currentOutputs[gid];
     float deriv = (o > 0.0f) ? 1.0f : 0.01f;
-    currentDeltas[gid] = err * deriv;
+    float bnScale = 1.0f;
+    if (useBatchNorm != 0) {
+        bnScale = rsqrt(bnVar[gid] + 1.0e-5f);
+    }
+    currentDeltas[gid] = err * deriv * bnScale;
 }
 
 __kernel void accumulate_weight_grads(
@@ -179,12 +192,15 @@ __kernel void first_layer_input_grads(
 __kernel void dense_forward_batch(
     __global const float* weights,
     __global const float* biases,
+    __global const float* bnMean,
+    __global const float* bnVar,
     __global const float* in,
     __global float* out,
     const int inSize,
     const int outSize,
     const int batchSize,
-    const int activation
+    const int activation,
+    const int useBatchNorm
 ) {
     int gid = get_global_id(0);
     int total = outSize * batchSize;
@@ -198,6 +214,10 @@ __kernel void dense_forward_batch(
     int inBase = sample * inSize;
     for (int i = 0; i < inSize; i++) {
         sum += weights[wBase + i] * in[inBase + i];
+    }
+
+    if (useBatchNorm != 0) {
+        sum = (sum - bnMean[neuron]) * rsqrt(bnVar[neuron] + 1.0e-5f);
     }
 
     if (activation == 0) {
@@ -233,11 +253,13 @@ __kernel void output_delta_bce_batch(
 __kernel void hidden_delta_batch(
     __global const float* nextWeights,
     __global const float* nextDeltas,
+    __global const float* bnVar,
     __global const float* currentOutputs,
     __global float* currentDeltas,
     const int currentSize,
     const int nextSize,
-    const int batchSize
+    const int batchSize,
+    const int useBatchNorm
 ) {
     int gid = get_global_id(0);
     int total = currentSize * batchSize;
@@ -254,7 +276,11 @@ __kernel void hidden_delta_batch(
 
     float o = currentOutputs[gid];
     float deriv = (o > 0.0f) ? 1.0f : 0.01f;
-    currentDeltas[gid] = err * deriv;
+    float bnScale = 1.0f;
+    if (useBatchNorm != 0) {
+        bnScale = rsqrt(bnVar[cur] + 1.0e-5f);
+    }
+    currentDeltas[gid] = err * deriv * bnScale;
 }
 
 __kernel void set_output_deltas_batch(
@@ -383,20 +409,24 @@ __kernel void attention_output_deltas_from_input_grads(
 `
 
 type openclLayerBuffers struct {
-	inSize   int
-	outSize  int
-	weights  *cl.MemObject
-	biases   *cl.MemObject
-	weightM  *cl.MemObject
-	weightV  *cl.MemObject
-	biasM    *cl.MemObject
-	biasV    *cl.MemObject
-	outputs  *cl.MemObject
-	deltas   *cl.MemObject
-	batchOut *cl.MemObject
-	batchDel *cl.MemObject
-	gradWBuf *cl.MemObject
-	gradBBuf *cl.MemObject
+	inSize      int
+	outSize     int
+	weights     *cl.MemObject
+	biases      *cl.MemObject
+	bnMean      *cl.MemObject
+	bnVar       *cl.MemObject
+	bnBatchMean *cl.MemObject
+	bnBatchVar  *cl.MemObject
+	weightM     *cl.MemObject
+	weightV     *cl.MemObject
+	biasM       *cl.MemObject
+	biasV       *cl.MemObject
+	outputs     *cl.MemObject
+	deltas      *cl.MemObject
+	batchOut    *cl.MemObject
+	batchDel    *cl.MemObject
+	gradWBuf    *cl.MemObject
+	gradBBuf    *cl.MemObject
 }
 
 type openclMLPBackend struct {
@@ -435,10 +465,17 @@ type openclMLPBackend struct {
 	attentionDeltaBuf *cl.MemObject
 	inputGradBuf      *cl.MemObject
 	inputGradBatchBuf *cl.MemObject
+	bnNeutralMean     *cl.MemObject
+	bnNeutralVar      *cl.MemObject
 	workBufSize       int
 	maxBatchSize      int
 	lastBatchSize     int
 }
+
+const (
+	bnRunningMomentum = 0.9
+	bnEpsilon         = 1e-5
+)
 
 func (b *openclMLPBackend) float32To64(in []float32) []float64 {
 	out := make([]float64, len(in))
@@ -788,6 +825,8 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 
 		weights := flatten2DF64(layer.Weights)
 		biases := float64To32(layer.Biases)
+		bnMean := float64To32(layer.BNRunningMean)
+		bnVar := float64To32(layer.BNRunningVar)
 		weightM := make([]float32, len(weights))
 		weightV := make([]float32, len(weights))
 		biasM := make([]float32, len(biases))
@@ -804,10 +843,52 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 			backend.Release()
 			return nil, fmt.Errorf("create bias buffer layer %d: %w", i, e)
 		}
+		bnMeanBuf, e := createRWBufferWithData(bnMean)
+		if e != nil {
+			wBuf.Release()
+			bBuf.Release()
+			backend.Release()
+			return nil, fmt.Errorf("create bn-mean buffer layer %d: %w", i, e)
+		}
+		bnVarBuf, e := createRWBufferWithData(bnVar)
+		if e != nil {
+			wBuf.Release()
+			bBuf.Release()
+			bnMeanBuf.Release()
+			backend.Release()
+			return nil, fmt.Errorf("create bn-var buffer layer %d: %w", i, e)
+		}
+		bnBatchMeanBuf, e := createRWBufferWithData(make([]float32, outSize))
+		if e != nil {
+			wBuf.Release()
+			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			backend.Release()
+			return nil, fmt.Errorf("create bn-batch-mean buffer layer %d: %w", i, e)
+		}
+		bnBatchVarInit := make([]float32, outSize)
+		for j := range bnBatchVarInit {
+			bnBatchVarInit[j] = 1
+		}
+		bnBatchVarBuf, e := createRWBufferWithData(bnBatchVarInit)
+		if e != nil {
+			wBuf.Release()
+			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			backend.Release()
+			return nil, fmt.Errorf("create bn-batch-var buffer layer %d: %w", i, e)
+		}
 		wmBuf, e := createRWBufferWithData(weightM)
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			backend.Release()
 			return nil, fmt.Errorf("create weight m buffer layer %d: %w", i, e)
 		}
@@ -815,6 +896,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			backend.Release()
 			return nil, fmt.Errorf("create weight v buffer layer %d: %w", i, e)
@@ -823,6 +908,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			backend.Release()
@@ -832,6 +921,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			bmBuf.Release()
@@ -842,6 +935,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			bmBuf.Release()
@@ -853,6 +950,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			bmBuf.Release()
@@ -865,6 +966,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			bmBuf.Release()
@@ -878,6 +983,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			bmBuf.Release()
@@ -892,6 +1001,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			bmBuf.Release()
@@ -907,6 +1020,10 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		if e != nil {
 			wBuf.Release()
 			bBuf.Release()
+			bnMeanBuf.Release()
+			bnVarBuf.Release()
+			bnBatchMeanBuf.Release()
+			bnBatchVarBuf.Release()
 			wmBuf.Release()
 			wvBuf.Release()
 			bmBuf.Release()
@@ -921,20 +1038,24 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		}
 
 		backend.layers[i] = &openclLayerBuffers{
-			inSize:   inSize,
-			outSize:  outSize,
-			weights:  wBuf,
-			biases:   bBuf,
-			weightM:  wmBuf,
-			weightV:  wvBuf,
-			biasM:    bmBuf,
-			biasV:    bvBuf,
-			outputs:  outBuf,
-			deltas:   deltaBuf,
-			batchOut: batchOutBuf,
-			batchDel: batchDelBuf,
-			gradWBuf: gradW,
-			gradBBuf: gradB,
+			inSize:      inSize,
+			outSize:     outSize,
+			weights:     wBuf,
+			biases:      bBuf,
+			bnMean:      bnMeanBuf,
+			bnVar:       bnVarBuf,
+			bnBatchMean: bnBatchMeanBuf,
+			bnBatchVar:  bnBatchVarBuf,
+			weightM:     wmBuf,
+			weightV:     wvBuf,
+			biasM:       bmBuf,
+			biasV:       bvBuf,
+			outputs:     outBuf,
+			deltas:      deltaBuf,
+			batchOut:    batchOutBuf,
+			batchDel:    batchDelBuf,
+			gradWBuf:    gradW,
+			gradBBuf:    gradB,
 		}
 	}
 
@@ -942,6 +1063,20 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		maxWidth = 1
 	}
 	backend.workBufSize = maxWidth
+	backend.bnNeutralMean, err = createRWBufferWithData(make([]float32, maxWidth))
+	if err != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create neutral BN mean buffer: %w", err)
+	}
+	oneVar := make([]float32, maxWidth)
+	for i := range oneVar {
+		oneVar[i] = 1
+	}
+	backend.bnNeutralVar, err = createRWBufferWithData(oneVar)
+	if err != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create neutral BN var buffer: %w", err)
+	}
 	backend.scratchA, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth)
 	if err != nil {
 		backend.Release()
@@ -1008,6 +1143,18 @@ func (b *openclMLPBackend) Release() {
 		if l.biases != nil {
 			l.biases.Release()
 		}
+		if l.bnMean != nil {
+			l.bnMean.Release()
+		}
+		if l.bnVar != nil {
+			l.bnVar.Release()
+		}
+		if l.bnBatchMean != nil {
+			l.bnBatchMean.Release()
+		}
+		if l.bnBatchVar != nil {
+			l.bnBatchVar.Release()
+		}
 		if l.weightM != nil {
 			l.weightM.Release()
 		}
@@ -1065,6 +1212,12 @@ func (b *openclMLPBackend) Release() {
 	}
 	if b.inputGradBatchBuf != nil {
 		b.inputGradBatchBuf.Release()
+	}
+	if b.bnNeutralMean != nil {
+		b.bnNeutralMean.Release()
+	}
+	if b.bnNeutralVar != nil {
+		b.bnNeutralVar.Release()
 	}
 
 	if b.denseForwardKernel != nil {
@@ -1133,11 +1286,19 @@ func (b *openclMLPBackend) syncParamsFromHost(mlp *MLP) error {
 	for i, layer := range mlp.Layers {
 		w := flatten2DF64(layer.Weights)
 		bv := float64To32(layer.Biases)
+		bnMean := float64To32(layer.BNRunningMean)
+		bnVar := float64To32(layer.BNRunningVar)
 		if _, err := b.queue.EnqueueWriteBufferFloat32(b.layers[i].weights, true, 0, w, nil); err != nil {
 			return fmt.Errorf("upload weights layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueWriteBufferFloat32(b.layers[i].biases, true, 0, bv, nil); err != nil {
 			return fmt.Errorf("upload biases layer %d: %w", i, err)
+		}
+		if _, err := b.queue.EnqueueWriteBufferFloat32(b.layers[i].bnMean, true, 0, bnMean, nil); err != nil {
+			return fmt.Errorf("upload bn mean layer %d: %w", i, err)
+		}
+		if _, err := b.queue.EnqueueWriteBufferFloat32(b.layers[i].bnVar, true, 0, bnVar, nil); err != nil {
+			return fmt.Errorf("upload bn var layer %d: %w", i, err)
 		}
 	}
 	return nil
@@ -1152,6 +1313,8 @@ func (b *openclMLPBackend) syncParamsToHost(mlp *MLP) error {
 		weightCount := layer.inSize * layer.outSize
 		wOut := make([]float32, weightCount)
 		bOut := make([]float32, layer.outSize)
+		bnMeanOut := make([]float32, layer.outSize)
+		bnVarOut := make([]float32, layer.outSize)
 
 		if _, err := b.queue.EnqueueReadBufferFloat32(layer.weights, true, 0, wOut, nil); err != nil {
 			return fmt.Errorf("download weights layer %d: %w", i, err)
@@ -1159,10 +1322,18 @@ func (b *openclMLPBackend) syncParamsToHost(mlp *MLP) error {
 		if _, err := b.queue.EnqueueReadBufferFloat32(layer.biases, true, 0, bOut, nil); err != nil {
 			return fmt.Errorf("download biases layer %d: %w", i, err)
 		}
+		if _, err := b.queue.EnqueueReadBufferFloat32(layer.bnMean, true, 0, bnMeanOut, nil); err != nil {
+			return fmt.Errorf("download bn mean layer %d: %w", i, err)
+		}
+		if _, err := b.queue.EnqueueReadBufferFloat32(layer.bnVar, true, 0, bnVarOut, nil); err != nil {
+			return fmt.Errorf("download bn var layer %d: %w", i, err)
+		}
 
 		unflattenTo2DF64(mlp.Layers[i].Weights, wOut)
 		for j := range bOut {
 			mlp.Layers[i].Biases[j] = float64(bOut[j])
+			mlp.Layers[i].BNRunningMean[j] = float64(bnMeanOut[j])
+			mlp.Layers[i].BNRunningVar[j] = float64(bnVarOut[j])
 		}
 	}
 	return b.queue.Finish()
@@ -1183,6 +1354,81 @@ func (b *openclMLPBackend) clearGradients() error {
 		}
 	}
 	return b.queue.Finish()
+}
+
+func isHiddenLayer(layerIdx int, totalLayers int) bool {
+	return layerIdx >= 0 && layerIdx < totalLayers-1
+}
+
+func (b *openclMLPBackend) bnBuffersForLayer(layerIdx int, totalLayers int, useBatchStats bool) (*cl.MemObject, *cl.MemObject, int32) {
+	if !isHiddenLayer(layerIdx, totalLayers) {
+		return b.bnNeutralMean, b.bnNeutralVar, 0
+	}
+	layer := b.layers[layerIdx]
+	if useBatchStats {
+		return layer.bnBatchMean, layer.bnBatchVar, 1
+	}
+	return layer.bnMean, layer.bnVar, 1
+}
+
+func (b *openclMLPBackend) refreshBatchNormStats(mlp *MLP, layerIdx int, batchSize int) error {
+	if !isHiddenLayer(layerIdx, len(b.layers)) {
+		return nil
+	}
+	layer := b.layers[layerIdx]
+	outSize := layer.outSize
+	if outSize == 0 || batchSize == 0 {
+		return nil
+	}
+
+	flat := make([]float32, outSize*batchSize)
+	if _, err := b.queue.EnqueueReadBufferFloat32(layer.batchOut, true, 0, flat, nil); err != nil {
+		return fmt.Errorf("read batch pre-activations layer %d: %w", layerIdx, err)
+	}
+
+	batchMean := make([]float32, outSize)
+	batchVar := make([]float32, outSize)
+	hostLayer := mlp.Layers[layerIdx]
+	invBatch := 1.0 / float64(batchSize)
+	for j := 0; j < outSize; j++ {
+		mean := 0.0
+		for s := 0; s < batchSize; s++ {
+			mean += float64(flat[s*outSize+j])
+		}
+		mean *= invBatch
+		variance := 0.0
+		for s := 0; s < batchSize; s++ {
+			d := float64(flat[s*outSize+j]) - mean
+			variance += d * d
+		}
+		variance *= invBatch
+		if variance < bnEpsilon {
+			variance = bnEpsilon
+		}
+
+		batchMean[j] = float32(mean)
+		batchVar[j] = float32(variance)
+		hostLayer.BNRunningMean[j] = bnRunningMomentum*hostLayer.BNRunningMean[j] + (1.0-bnRunningMomentum)*mean
+		hostLayer.BNRunningVar[j] = bnRunningMomentum*hostLayer.BNRunningVar[j] + (1.0-bnRunningMomentum)*variance
+	}
+
+	if _, err := b.queue.EnqueueWriteBufferFloat32(layer.bnBatchMean, true, 0, batchMean, nil); err != nil {
+		return fmt.Errorf("write batch BN mean layer %d: %w", layerIdx, err)
+	}
+	if _, err := b.queue.EnqueueWriteBufferFloat32(layer.bnBatchVar, true, 0, batchVar, nil); err != nil {
+		return fmt.Errorf("write batch BN var layer %d: %w", layerIdx, err)
+	}
+
+	runningMean32 := float64To32(hostLayer.BNRunningMean)
+	runningVar32 := float64To32(hostLayer.BNRunningVar)
+	if _, err := b.queue.EnqueueWriteBufferFloat32(layer.bnMean, true, 0, runningMean32, nil); err != nil {
+		return fmt.Errorf("write running BN mean layer %d: %w", layerIdx, err)
+	}
+	if _, err := b.queue.EnqueueWriteBufferFloat32(layer.bnVar, true, 0, runningVar32, nil); err != nil {
+		return fmt.Errorf("write running BN var layer %d: %w", layerIdx, err)
+	}
+
+	return nil
 }
 
 func (b *openclMLPBackend) forward(mlp *MLP, inputs []float64, cache *InferenceCache) ([]float64, error) {
@@ -1212,7 +1458,8 @@ func (b *openclMLPBackend) forward(mlp *MLP, inputs []float64, cache *InferenceC
 			}
 		}
 
-		if err := b.denseForwardKernel.SetArgs(layer.weights, layer.biases, current, next, int32(lastOutSize), int32(layer.outSize), activation); err != nil {
+		bnMeanBuf, bnVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), false)
+		if err := b.denseForwardKernel.SetArgs(layer.weights, layer.biases, bnMeanBuf, bnVarBuf, current, next, int32(lastOutSize), int32(layer.outSize), activation, useBN); err != nil {
 			return nil, fmt.Errorf("set dense_forward args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardKernel, nil, []int{layer.outSize}, nil, nil); err != nil {
@@ -1285,10 +1532,11 @@ func (b *openclMLPBackend) forwardBatch(mlp *MLP, inputsBatch [][]float64) ([][]
 				activation = 1
 			}
 		}
+		bnMeanBuf, bnVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), false)
 
 		if err := b.denseForwardBatchKernel.SetArgs(
-			layer.weights, layer.biases, currentInputBuf, layer.batchOut,
-			int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation,
+			layer.weights, layer.biases, bnMeanBuf, bnVarBuf, currentInputBuf, layer.batchOut,
+			int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation, useBN,
 		); err != nil {
 			return nil, fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
 		}
@@ -1335,7 +1583,8 @@ func (b *openclMLPBackend) forwardAndStore(mlp *MLP, inputs []float64, cache *Wo
 				activation = 1
 			}
 		}
-		if err := b.denseForwardKernel.SetArgs(layer.weights, layer.biases, currentInputBuf, layer.outputs, int32(currentInputSize), int32(layer.outSize), activation); err != nil {
+		bnMeanBuf, bnVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), false)
+		if err := b.denseForwardKernel.SetArgs(layer.weights, layer.biases, bnMeanBuf, bnVarBuf, currentInputBuf, layer.outputs, int32(currentInputSize), int32(layer.outSize), activation, useBN); err != nil {
 			return fmt.Errorf("set dense_forward(train) args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardKernel, nil, []int{layer.outSize}, nil, nil); err != nil {
@@ -1410,7 +1659,8 @@ func (b *openclMLPBackend) calculateBCELocalGradients(mlp *MLP, inputs []float64
 	for i := len(b.layers) - 2; i >= 0; i-- {
 		cur := b.layers[i]
 		next := b.layers[i+1]
-		if err := b.hiddenDeltaKernel.SetArgs(next.weights, next.deltas, cur.outputs, cur.deltas, int32(cur.outSize), int32(next.outSize)); err != nil {
+		_, curBNVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), false)
+		if err := b.hiddenDeltaKernel.SetArgs(next.weights, next.deltas, curBNVarBuf, cur.outputs, cur.deltas, int32(cur.outSize), int32(next.outSize), useBN); err != nil {
 			return 0, fmt.Errorf("set hidden_delta args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.hiddenDeltaKernel, nil, []int{cur.outSize}, nil, nil); err != nil {
@@ -1493,23 +1743,43 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 	currentInputBuf := b.batchInputBuf
 	currentInputSize := inSize
 	for i, layer := range b.layers {
-		activation := int32(0)
-		if i == len(b.layers)-1 {
+		if isHiddenLayer(i, len(b.layers)) {
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, b.bnNeutralMean, b.bnNeutralVar, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), int32(2), int32(0),
+			); err != nil {
+				return 0, nil, fmt.Errorf("set dense_forward_batch linear args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return 0, nil, fmt.Errorf("enqueue dense_forward_batch linear layer %d: %w", i, err)
+			}
+			if err := b.refreshBatchNormStats(mlp, i, batchSize); err != nil {
+				return 0, nil, err
+			}
+			bnMeanBuf, bnVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), true)
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, bnMeanBuf, bnVarBuf, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), int32(0), useBN,
+			); err != nil {
+				return 0, nil, fmt.Errorf("set dense_forward_batch BN args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return 0, nil, fmt.Errorf("enqueue dense_forward_batch BN layer %d: %w", i, err)
+			}
+		} else {
+			activation := int32(1)
 			if mlp.LinearOutput {
 				activation = 2
-			} else {
-				activation = 1
 			}
-		}
-
-		if err := b.denseForwardBatchKernel.SetArgs(
-			layer.weights, layer.biases, currentInputBuf, layer.batchOut,
-			int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation,
-		); err != nil {
-			return 0, nil, fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
-		}
-		if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
-			return 0, nil, fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, b.bnNeutralMean, b.bnNeutralVar, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation, int32(0),
+			); err != nil {
+				return 0, nil, fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return 0, nil, fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
+			}
 		}
 
 		currentInputBuf = layer.batchOut
@@ -1573,7 +1843,8 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 	for i := len(b.layers) - 2; i >= 0; i-- {
 		cur := b.layers[i]
 		next := b.layers[i+1]
-		if err := b.hiddenDeltaBatchKernel.SetArgs(next.weights, next.batchDel, cur.batchOut, cur.batchDel, int32(cur.outSize), int32(next.outSize), int32(batchSize)); err != nil {
+		_, curBNVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), true)
+		if err := b.hiddenDeltaBatchKernel.SetArgs(next.weights, next.batchDel, curBNVarBuf, cur.batchOut, cur.batchDel, int32(cur.outSize), int32(next.outSize), int32(batchSize), useBN); err != nil {
 			return 0, nil, fmt.Errorf("set hidden_delta_batch args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.hiddenDeltaBatchKernel, nil, []int{cur.outSize * batchSize}, nil, nil); err != nil {
@@ -1640,7 +1911,8 @@ func (b *openclMLPBackend) backpropGivenDeltas(mlp *MLP, inputs []float64, outpu
 	for i := len(b.layers) - 2; i >= 0; i-- {
 		cur := b.layers[i]
 		next := b.layers[i+1]
-		if err := b.hiddenDeltaKernel.SetArgs(next.weights, next.deltas, cur.outputs, cur.deltas, int32(cur.outSize), int32(next.outSize)); err != nil {
+		_, curBNVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), false)
+		if err := b.hiddenDeltaKernel.SetArgs(next.weights, next.deltas, curBNVarBuf, cur.outputs, cur.deltas, int32(cur.outSize), int32(next.outSize), useBN); err != nil {
 			return fmt.Errorf("set hidden_delta args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.hiddenDeltaKernel, nil, []int{cur.outSize}, nil, nil); err != nil {
@@ -1722,22 +1994,43 @@ func (b *openclMLPBackend) backpropGivenDeltasBatch(mlp *MLP, inputsBatch [][]fl
 	currentInputBuf := b.batchInputBuf
 	currentInputSize := inSize
 	for i, layer := range b.layers {
-		activation := int32(0)
-		if i == len(b.layers)-1 {
+		if isHiddenLayer(i, len(b.layers)) {
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, b.bnNeutralMean, b.bnNeutralVar, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), int32(2), int32(0),
+			); err != nil {
+				return fmt.Errorf("set dense_forward_batch linear args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return fmt.Errorf("enqueue dense_forward_batch linear layer %d: %w", i, err)
+			}
+			if err := b.refreshBatchNormStats(mlp, i, batchSize); err != nil {
+				return err
+			}
+			bnMeanBuf, bnVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), true)
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, bnMeanBuf, bnVarBuf, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), int32(0), useBN,
+			); err != nil {
+				return fmt.Errorf("set dense_forward_batch BN args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return fmt.Errorf("enqueue dense_forward_batch BN layer %d: %w", i, err)
+			}
+		} else {
+			activation := int32(1)
 			if mlp.LinearOutput {
 				activation = 2
-			} else {
-				activation = 1
 			}
-		}
-		if err := b.denseForwardBatchKernel.SetArgs(
-			layer.weights, layer.biases, currentInputBuf, layer.batchOut,
-			int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation,
-		); err != nil {
-			return fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
-		}
-		if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
-			return fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, b.bnNeutralMean, b.bnNeutralVar, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation, int32(0),
+			); err != nil {
+				return fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
+			}
 		}
 		currentInputBuf = layer.batchOut
 		currentInputSize = layer.outSize
@@ -1774,7 +2067,8 @@ func (b *openclMLPBackend) backpropGivenDeltasBatch(mlp *MLP, inputsBatch [][]fl
 	for i := len(b.layers) - 2; i >= 0; i-- {
 		cur := b.layers[i]
 		next := b.layers[i+1]
-		if err := b.hiddenDeltaBatchKernel.SetArgs(next.weights, next.batchDel, cur.batchOut, cur.batchDel, int32(cur.outSize), int32(next.outSize), int32(batchSize)); err != nil {
+		_, curBNVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), true)
+		if err := b.hiddenDeltaBatchKernel.SetArgs(next.weights, next.batchDel, curBNVarBuf, cur.batchOut, cur.batchDel, int32(cur.outSize), int32(next.outSize), int32(batchSize), useBN); err != nil {
 			return fmt.Errorf("set hidden_delta_batch args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.hiddenDeltaBatchKernel, nil, []int{cur.outSize * batchSize}, nil, nil); err != nil {
@@ -1879,22 +2173,43 @@ func (b *openclMLPBackend) backpropAttentionFromInputGradsBatch(
 	currentInputBuf := b.batchInputBuf
 	currentInputSize := inSize
 	for i, layer := range b.layers {
-		activation := int32(0)
-		if i == len(b.layers)-1 {
+		if isHiddenLayer(i, len(b.layers)) {
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, b.bnNeutralMean, b.bnNeutralVar, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), int32(2), int32(0),
+			); err != nil {
+				return fmt.Errorf("set dense_forward_batch linear args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return fmt.Errorf("enqueue dense_forward_batch linear layer %d: %w", i, err)
+			}
+			if err := b.refreshBatchNormStats(mlp, i, batchSize); err != nil {
+				return err
+			}
+			bnMeanBuf, bnVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), true)
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, bnMeanBuf, bnVarBuf, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), int32(0), useBN,
+			); err != nil {
+				return fmt.Errorf("set dense_forward_batch BN args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return fmt.Errorf("enqueue dense_forward_batch BN layer %d: %w", i, err)
+			}
+		} else {
+			activation := int32(1)
 			if mlp.LinearOutput {
 				activation = 2
-			} else {
-				activation = 1
 			}
-		}
-		if err := b.denseForwardBatchKernel.SetArgs(
-			layer.weights, layer.biases, currentInputBuf, layer.batchOut,
-			int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation,
-		); err != nil {
-			return fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
-		}
-		if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
-			return fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
+			if err := b.denseForwardBatchKernel.SetArgs(
+				layer.weights, layer.biases, b.bnNeutralMean, b.bnNeutralVar, currentInputBuf, layer.batchOut,
+				int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation, int32(0),
+			); err != nil {
+				return fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
+			}
+			if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
+				return fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
+			}
 		}
 		currentInputBuf = layer.batchOut
 		currentInputSize = layer.outSize
@@ -1944,7 +2259,8 @@ func (b *openclMLPBackend) backpropAttentionFromInputGradsBatch(
 	for i := len(b.layers) - 2; i >= 0; i-- {
 		cur := b.layers[i]
 		next := b.layers[i+1]
-		if err := b.hiddenDeltaBatchKernel.SetArgs(next.weights, next.batchDel, cur.batchOut, cur.batchDel, int32(cur.outSize), int32(next.outSize), int32(batchSize)); err != nil {
+		_, curBNVarBuf, useBN := b.bnBuffersForLayer(i, len(b.layers), true)
+		if err := b.hiddenDeltaBatchKernel.SetArgs(next.weights, next.batchDel, curBNVarBuf, cur.batchOut, cur.batchDel, int32(cur.outSize), int32(next.outSize), int32(batchSize), useBN); err != nil {
 			return fmt.Errorf("set hidden_delta_batch args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.hiddenDeltaBatchKernel, nil, []int{cur.outSize * batchSize}, nil, nil); err != nil {
