@@ -25,6 +25,7 @@ const defaultKernelBatchSize = 64
 const kernelTuneIterations = 8
 const WeightDecay = 0.0001
 const TrainingTurnThreshold = 20
+const trainLatentBootstrapPasses = 5
 
 // TrainingState preserves progress across restarts
 type TrainingState struct {
@@ -441,6 +442,7 @@ func buildPreparedSnapshot(state *simulator.BattleState, chosenAction int, match
 	vectorizeBoosts(state.P1.GetActive(), &prefixArr, &idx)
 	vectorizeBoosts(state.P2.GetActive(), &prefixArr, &idx)
 	vectorizeMatchup(state, &prefixArr, &idx)
+	vectorizeLatentTokens(&prefixArr, &idx, DefaultLatentReasoningToken, DefaultLatentPredictionToken)
 
 	turnPct := 0.0
 	if totalTurns > 0 {
@@ -504,9 +506,20 @@ func actionLabelForIndex(action int) string {
 	return fmt.Sprintf("action%d", action)
 }
 
+func appendLatentBootstrapSnapshots(samples []preparedSnapshot, base preparedSnapshot) []preparedSnapshot {
+	for i := 0; i < trainLatentBootstrapPasses; i++ {
+		clone := base
+		clone.prefix = append([]float64(nil), base.prefix...)
+		clone.prefix[TotalGlobals-LatentTokenFeatures] = rand.Float64()*2.0 - 1.0
+		clone.prefix[TotalGlobals-1] = rand.Float64()*2.0 - 1.0
+		samples = append(samples, clone)
+	}
+	return samples
+}
+
 func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, eloWeight float64, gameID uint64) ([]preparedSnapshot, replayLabelStats) {
 	stats := newReplayLabelStats()
-	samples := make([]preparedSnapshot, 0, len(replay.Events)/2)
+	samples := make([]preparedSnapshot, 0, (len(replay.Events)/2)*trainLatentBootstrapPasses)
 
 	for i, event := range replay.Events {
 		if event.Player != "p1" || event.Turn < TrainingTurnThreshold {
@@ -531,7 +544,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.skip(reason)
 				continue
 			}
-			samples = append(samples, snapshot)
+			samples = appendLatentBootstrapSnapshots(samples, snapshot)
 			stats.mapped++
 			stats.actionFreq[action]++
 
@@ -561,7 +574,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.skip(reason)
 				continue
 			}
-			samples = append(samples, snapshot)
+			samples = appendLatentBootstrapSnapshots(samples, snapshot)
 			stats.mapped++
 			stats.actionFreq[action]++
 
@@ -591,7 +604,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.skip(reason)
 				continue
 			}
-			samples = append(samples, snapshot)
+			samples = appendLatentBootstrapSnapshots(samples, snapshot)
 			stats.mapped++
 			stats.actionFreq[action]++
 		}
@@ -769,7 +782,7 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		fmt.Println("Starting MoE router from scratch...")
 	}
 
-	learningRate := 0.001
+	learningRate := 0.05
 	bestMSE := math.MaxFloat64
 	patienceCounter := 0
 	startEpoch := 1
@@ -785,9 +798,11 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		attentionMLP.AdamStep = state.AttnAdamStep
 	}
 
-	const patience = 3  // epochs without improvement before reducing LR
-	const lrDecay = 0.5 // multiply LR by this on plateau
-	const minLR = 1e-5  // floor to prevent vanishing updates
+	const rapidLRDecay = 0.4      // aggressively decay LR each epoch
+	const normalScheduleLR = 0.001 // switch to plateau schedule at this LR
+	const patience = 3            // epochs without improvement before reducing LR
+	const lrDecay = 0.5           // multiply LR by this on plateau
+	const minLR = 1e-5            // floor to prevent vanishing updates
 	numWorkers := runtime.NumCPU()
 	kernelBatchSize := tuneKernelBatchSize(mlp, attentionMLP)
 	trainingStart := time.Now()
@@ -962,8 +977,22 @@ func TrainNetwork(replaysDir string, epochs int) error {
 			patienceCounter++
 		}
 
-		// Adaptive LR: reduce on plateau
-		if patienceCounter >= patience && learningRate > minLR {
+		if learningRate > normalScheduleLR {
+			// Exploration phase: force fast decay to quickly find a good LR basin.
+			nextLR := learningRate * rapidLRDecay
+			if nextLR < normalScheduleLR {
+				nextLR = normalScheduleLR
+			}
+			if nextLR != learningRate {
+				fmt.Printf("  -> Rapid LR decay: %.6f -> %.6f\n", learningRate, nextLR)
+			}
+			if nextLR == normalScheduleLR {
+				patienceCounter = 0
+				fmt.Printf("  -> Switched to normal plateau LR schedule at %.6f\n", nextLR)
+			}
+			learningRate = nextLR
+		} else if patienceCounter >= patience && learningRate > minLR {
+			// Normal schedule: reduce LR only on plateau.
 			learningRate *= lrDecay
 			if learningRate < minLR {
 				learningRate = minLR

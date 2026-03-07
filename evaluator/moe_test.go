@@ -3,7 +3,7 @@ package evaluator
 import "testing"
 
 func TestAttentionRouterParamCountStableAfterExpertIncrease(t *testing.T) {
-	const target = 285620
+	const target = 67854
 	got := mlpParamCount(attentionMLPLayerSizes())
 	if got != target {
 		t.Fatalf("router param count mismatch: got %d expected %d", got, target)

@@ -9,14 +9,16 @@ import (
 const TaggedReplayVersion = 1
 
 type TaggedSample struct {
-	Prefix      []float64 `json:"prefix"`
-	RawSlots    []float64 `json:"rawSlots"`
-	Targets      []float64 `json:"targets"`
-	ValidActions []int     `json:"validActions,omitempty"`
-	EloWeight    float64   `json:"eloWeight"`
-	Turn         int       `json:"turn,omitempty"`
-	EventIdx     int       `json:"eventIdx,omitempty"`
-	IsSearchTag  bool      `json:"isSearchTag,omitempty"`
+	Prefix                []float64 `json:"prefix"`
+	RawSlots              []float64 `json:"rawSlots"`
+	Targets               []float64 `json:"targets"`
+	ValidActions          []int     `json:"validActions,omitempty"`
+	EloWeight             float64   `json:"eloWeight"`
+	Turn                  int       `json:"turn,omitempty"`
+	EventIdx              int       `json:"eventIdx,omitempty"`
+	IsSearchTag           bool      `json:"isSearchTag,omitempty"`
+	LatentReasoningToken  float64   `json:"latentReasoningToken,omitempty"`
+	LatentPredictionToken float64   `json:"latentPredictionToken,omitempty"`
 }
 
 type TaggedReplayDataset struct {
@@ -27,6 +29,10 @@ type TaggedReplayDataset struct {
 }
 
 func BuildTaggedSampleFromState(state *simulator.BattleState, targets []float64, eloWeight float64, isSearchTag bool) (TaggedSample, string, bool) {
+	return BuildTaggedSampleFromStateWithLatents(state, targets, eloWeight, isSearchTag, DefaultLatentReasoningToken, DefaultLatentPredictionToken)
+}
+
+func BuildTaggedSampleFromStateWithLatents(state *simulator.BattleState, targets []float64, eloWeight float64, isSearchTag bool, latentReasoningToken float64, latentPredictionToken float64) (TaggedSample, string, bool) {
 	if len(targets) != simulator.MaxActions {
 		return TaggedSample{}, "target_length_mismatch", false
 	}
@@ -69,14 +75,17 @@ func BuildTaggedSampleFromState(state *simulator.BattleState, targets []float64,
 	vectorizeBoosts(state.P1.GetActive(), &prefixArr, &idx)
 	vectorizeBoosts(state.P2.GetActive(), &prefixArr, &idx)
 	vectorizeMatchup(state, &prefixArr, &idx)
+	vectorizeLatentTokens(&prefixArr, &idx, latentReasoningToken, latentPredictionToken)
 
 	return TaggedSample{
-		Prefix:       append([]float64(nil), prefixArr[:TotalGlobals]...),
-		RawSlots:     rawSlots,
-		Targets:      append([]float64(nil), targets...),
-		ValidActions: validActions,
-		EloWeight:    eloWeight,
-		IsSearchTag:  isSearchTag,
+		Prefix:                append([]float64(nil), prefixArr[:TotalGlobals]...),
+		RawSlots:              rawSlots,
+		Targets:               append([]float64(nil), targets...),
+		ValidActions:          validActions,
+		EloWeight:             eloWeight,
+		IsSearchTag:           isSearchTag,
+		LatentReasoningToken:  latentReasoningToken,
+		LatentPredictionToken: latentPredictionToken,
 	}, "", true
 }
 
@@ -98,7 +107,7 @@ func taggedSampleToPrepared(sample TaggedSample) (preparedSnapshot, error) {
 			}
 		}
 	}
-	
+
 	return preparedSnapshot{
 		prefix:       append([]float64(nil), sample.Prefix...),
 		rawSlots:     append([]float64(nil), sample.RawSlots...),

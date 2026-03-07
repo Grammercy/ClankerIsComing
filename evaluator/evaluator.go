@@ -27,11 +27,19 @@ const BoostFeatures = 10
 // MatchupFeatures = 2 (P1 vs P2 type effectiveness, P2 vs P1 type effectiveness)
 const MatchupFeatures = 2
 
-// TotalGlobals = 6 player globals + 12 field + 20 side (10*2) + 10 boosts (5*2) + 2 matchup
-const TotalGlobals = 6 + FieldFeatures + 2*SideFeatures + BoostFeatures + MatchupFeatures // 50
+// LatentTokenFeatures = 2 (reasoning token, prediction token)
+const LatentTokenFeatures = 2
+
+const (
+	DefaultLatentReasoningToken  = 0.0
+	DefaultLatentPredictionToken = 0.0
+)
+
+// TotalGlobals = 6 player globals + 12 field + 20 side (10*2) + 10 boosts (5*2) + 2 matchup + 2 latent tokens
+const TotalGlobals = 6 + FieldFeatures + 2*SideFeatures + BoostFeatures + MatchupFeatures + LatentTokenFeatures // 52
 
 // TotalFeatures is globals + slot features
-const TotalFeatures = TotalGlobals + TotalSlotFeatures // 1010
+const TotalFeatures = TotalGlobals + TotalSlotFeatures // 1012
 
 var (
 	GlobalMLP          *MLP
@@ -93,13 +101,17 @@ func GetCaches() (*InferenceCache, *InferenceCache) {
 }
 
 func EvaluateAll(state *simulator.BattleState, mlpCache *InferenceCache, attentionCache *InferenceCache) [simulator.MaxActions]float64 {
+	return EvaluateAllWithLatentTokens(state, mlpCache, attentionCache, DefaultLatentReasoningToken, DefaultLatentPredictionToken)
+}
+
+func EvaluateAllWithLatentTokens(state *simulator.BattleState, mlpCache *InferenceCache, attentionCache *InferenceCache, latentReasoningToken float64, latentPredictionToken float64) [simulator.MaxActions]float64 {
 	InitEvaluator()
 
 	var result [simulator.MaxActions]float64
 
 	if GlobalMLP != nil {
 		var features [TotalFeatures]float64
-		Vectorize(state, GlobalAttentionMLP, &features, attentionCache)
+		VectorizeWithLatentTokens(state, GlobalAttentionMLP, &features, attentionCache, latentReasoningToken, latentPredictionToken)
 		output := GlobalMLP.Forward(features[:], mlpCache)
 
 		for i := 0; i < simulator.MaxActions; i++ {
@@ -149,9 +161,13 @@ func AttentionWeights(state *simulator.BattleState, cache *InferenceCache) ([12]
 }
 
 func Evaluate(state *simulator.BattleState, action int, mlp *MLP, attentionMLP *MLP, mlpCache *InferenceCache, attentionCache *InferenceCache, tt *TranspositionTable) float64 {
+	return EvaluateWithLatentTokens(state, action, mlp, attentionMLP, mlpCache, attentionCache, tt, DefaultLatentReasoningToken, DefaultLatentPredictionToken)
+}
+
+func EvaluateWithLatentTokens(state *simulator.BattleState, action int, mlp *MLP, attentionMLP *MLP, mlpCache *InferenceCache, attentionCache *InferenceCache, tt *TranspositionTable, latentReasoningToken float64, latentPredictionToken float64) float64 {
 	if mlp != nil {
 		var features [TotalFeatures]float64
-		Vectorize(state, attentionMLP, &features, attentionCache)
+		VectorizeWithLatentTokens(state, attentionMLP, &features, attentionCache, latentReasoningToken, latentPredictionToken)
 
 		if tt != nil {
 			hash := HashFeatures(&features)
@@ -207,6 +223,10 @@ func Evaluate(state *simulator.BattleState, action int, mlp *MLP, attentionMLP *
 // EvaluateBatchStates evaluates multiple battle states in batches on GPU and returns
 // state values from P1 perspective (max Q over valid P1 actions for each state).
 func EvaluateBatchStates(states []simulator.BattleState) []float64 {
+	return EvaluateBatchStatesWithLatentTokens(states, DefaultLatentReasoningToken, DefaultLatentPredictionToken)
+}
+
+func EvaluateBatchStatesWithLatentTokens(states []simulator.BattleState, latentReasoningToken float64, latentPredictionToken float64) []float64 {
 	InitEvaluator()
 	results := make([]float64, len(states))
 	if len(states) == 0 {
@@ -257,6 +277,7 @@ func EvaluateBatchStates(states []simulator.BattleState) []float64 {
 		vectorizeBoosts(state.P1.GetActive(), &tmp, &tmpIdx)
 		vectorizeBoosts(state.P2.GetActive(), &tmp, &tmpIdx)
 		vectorizeMatchup(state, &tmp, &tmpIdx)
+		vectorizeLatentTokens(&tmp, &tmpIdx, latentReasoningToken, latentPredictionToken)
 		copy(mainInputs[i][:TotalGlobals], tmp[:TotalGlobals])
 
 		validActions, validLen := simulator.GetSearchActions(&state.P1)
@@ -317,6 +338,10 @@ func EvaluateBatchStates(states []simulator.BattleState) []float64 {
 // Vectorize converts a BattleState into a fixed-length float64 array for the Neural Network.
 // It writes directly into the given 'out' buffer to completely eliminate slice allocations during search.
 func Vectorize(state *simulator.BattleState, attention *MLP, out *[TotalFeatures]float64, cache *InferenceCache) {
+	VectorizeWithLatentTokens(state, attention, out, cache, DefaultLatentReasoningToken, DefaultLatentPredictionToken)
+}
+
+func VectorizeWithLatentTokens(state *simulator.BattleState, attention *MLP, out *[TotalFeatures]float64, cache *InferenceCache, latentReasoningToken float64, latentPredictionToken float64) {
 	idx := 0
 
 	// 6 player globals
@@ -350,6 +375,9 @@ func Vectorize(state *simulator.BattleState, attention *MLP, out *[TotalFeatures
 	// 2 type matchup features
 	vectorizeMatchup(state, out, &idx)
 
+	// 2 latent features
+	vectorizeLatentTokens(out, &idx, latentReasoningToken, latentPredictionToken)
+
 	// Track where slots begin for attention processing
 	slotsStartIdx := idx
 
@@ -381,6 +409,13 @@ func Vectorize(state *simulator.BattleState, attention *MLP, out *[TotalFeatures
 		}
 	}
 
+}
+
+func vectorizeLatentTokens(out *[TotalFeatures]float64, idx *int, latentReasoningToken float64, latentPredictionToken float64) {
+	out[*idx] = latentReasoningToken
+	*idx++
+	out[*idx] = latentPredictionToken
+	*idx++
 }
 
 // vectorizeFieldConditions writes 11 features for global field state into the out array

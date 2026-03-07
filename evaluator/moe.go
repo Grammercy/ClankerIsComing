@@ -4,16 +4,15 @@ import "math"
 
 const (
 	SlotAttentionSlots      = 12
-	SlotAttentionExperts    = 16
+	SlotAttentionExperts    = 22
 	SlotMoEOutputSize       = SlotAttentionExperts*SlotAttentionSlots + SlotAttentionExperts
 	SlotMoEBalanceLossScale = 0.02
 )
 
 func attentionMLPLayerSizes() []int {
-	// Keep router parameter count constant after increasing experts to 16.
-	// Old (4 experts): [960, 256, 128, 52] => 285,620 params
-	// New (16 experts): [960, 82, 710, 208] => 285,620 params
-	return []int{TotalSlotFeatures, 82, 710, SlotMoEOutputSize}
+	// Smaller MoE router for faster training/inference.
+	// [960, 48, 64, 286] => 67,854 params.
+	return []int{TotalSlotFeatures, 48, 64, SlotMoEOutputSize}
 }
 
 func softmax(logits []float64, probs []float64) bool {
