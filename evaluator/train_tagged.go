@@ -45,28 +45,14 @@ func buildInputFromPrepared(sample preparedSnapshot, attentionMLP *MLP) []float6
 	mainInputs := make([]float64, TotalFeatures)
 	copy(mainInputs, sample.prefix)
 
-	rawAttention := attentionMLP.Forward(sample.rawSlots, nil)
-	attentionWeights := make([]float64, len(rawAttention))
-	maxScore := -math.MaxFloat64
-	for _, score := range rawAttention {
-		if score > maxScore {
-			maxScore = score
-		}
-	}
-	sumExp := 0.0
-	for i, score := range rawAttention {
-		attentionWeights[i] = math.Exp(score - maxScore)
-		sumExp += attentionWeights[i]
-	}
-	if sumExp > 0 {
-		for i := range attentionWeights {
-			attentionWeights[i] /= sumExp
-		}
+	slotWeights, ok := attentionWeightsFromMoEOutput(attentionMLP.Forward(sample.rawSlots, nil))
+	if !ok {
+		slotWeights = uniformSlotWeights()
 	}
 
 	idx := TotalGlobals
-	for slotIdx := 0; slotIdx < len(attentionWeights); slotIdx++ {
-		w := attentionWeights[slotIdx]
+	for slotIdx := 0; slotIdx < SlotAttentionSlots; slotIdx++ {
+		w := slotWeights[slotIdx]
 		base := slotIdx * FeaturesPerSlot
 		for j := 0; j < FeaturesPerSlot; j++ {
 			mainInputs[idx] = sample.rawSlots[base+j] * w
@@ -140,21 +126,35 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		return err
 	}
 
-	fmt.Printf("Initializing Main MLP [%d -> 2048 -> 1024 -> 512 -> %d]...\n", TotalFeatures, simulator.MaxActions)
-	mlp := NewMLP([]int{TotalFeatures, 2048, 1024, 512, simulator.MaxActions})
+	mainSizes := mainMLPLayerSizes()
+	attnSizes := attentionMLPLayerSizes()
+	fmt.Printf("Initializing Main MLP %v (%d params)...\n", mainSizes, mlpParamCount(mainSizes))
+	fmt.Printf("Model total (main + MoE router): %d params\n", totalEvaluatorParamCount())
+	mlp := NewMLP(mainSizes)
 	if err := mlp.LoadWeights("evaluator_weights.json"); err == nil {
-		fmt.Println("Loaded existing evaluator_weights.json...")
+		if mlp.HasLayerSizes(mainSizes) {
+			fmt.Println("Loaded existing evaluator_weights.json...")
+		} else {
+			fmt.Println("Ignoring incompatible evaluator_weights.json (old architecture); starting Main MLP from scratch...")
+			mlp = NewMLP(mainSizes)
+		}
 	} else {
 		fmt.Println("Starting Main MLP from scratch...")
 	}
 
-	fmt.Printf("Initializing Attention MLP [%d -> 256 -> 128 -> 12]...\n", TotalSlotFeatures)
-	attentionMLP := NewMLP([]int{TotalSlotFeatures, 256, 128, 12})
+	fmt.Printf("Initializing MoE Router MLP %v (%d params, %d experts)...\n", attnSizes, mlpParamCount(attnSizes), SlotAttentionExperts)
+	attentionMLP := NewMLP(attnSizes)
 	attentionMLP.LinearOutput = true
 	if err := attentionMLP.LoadWeights("attention_weights.json"); err == nil {
-		fmt.Println("Loaded existing attention_weights.json...")
+		if attentionMLP.HasLayerSizes(attnSizes) {
+			fmt.Println("Loaded existing attention_weights.json...")
+		} else {
+			fmt.Println("Ignoring incompatible attention_weights.json (old architecture); starting MoE router from scratch...")
+			attentionMLP = NewMLP(attnSizes)
+			attentionMLP.LinearOutput = true
+		}
 	} else {
-		fmt.Println("Starting Attention MLP from scratch...")
+		fmt.Println("Starting MoE router from scratch...")
 	}
 
 	learningRate := 0.001
@@ -199,7 +199,7 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		go func() {
 			lastReport := time.Now()
 			for s := range progressCh {
-				if time.Since(lastReport) < 2*time.Second {
+				if time.Since(lastReport) < 1*time.Second {
 					continue
 				}
 				avgLoss := 0.0
@@ -287,13 +287,17 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 			loadStats.samplesSkipped,
 		)
 
-		totalLoss := stats.totalLoss
 		validSnapshots := stats.validSnapshots
+		avgBCE := math.MaxFloat64
+		avgBalance := 0.0
 		avgLoss := math.MaxFloat64
 		if validSnapshots > 0 {
-			avgLoss = totalLoss / float64(validSnapshots)
+			avgBCE = stats.totalBCELoss / float64(validSnapshots)
+			avgBalance = stats.totalBalance / float64(validSnapshots)
+			avgLoss = avgBCE + avgBalance
 		}
-		fmt.Printf("Epoch %d/%d - Train Loss (BCE): %.6f (Trained on %d snapshots, LR: %.6f)\n", epoch, epochs, avgLoss, validSnapshots, learningRate)
+		fmt.Printf("Epoch %d/%d - Train Loss: %.6f (BCE: %.6f, MoE balance: %.6f, snapshots: %d, LR: %.6f)\n",
+			epoch, epochs, avgLoss, avgBCE, avgBalance, validSnapshots, learningRate)
 		epochElapsed := time.Since(epochStart)
 		cumulativeEpochTime += epochElapsed
 		completedEpochs := epoch - startEpoch + 1
