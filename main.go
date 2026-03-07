@@ -24,6 +24,8 @@ import (
 	"github.com/pokemon-engine/simulator"
 )
 
+const latentTagEvalRepeats = 5
+
 func main() {
 	cmd := flag.String("cmd", "", "Command to run: 'scrape', 'parse', 'actions', 'verify-actions', 'evaluate', 'bulk-evaluate', 'train', 'train-tagged', 'mixed-train', 'selfplay', 'search-evaluate', 'tag', 'import', 'live'")
 	format := flag.String("format", "gen9randombattle", "Pokemon Showdown format to scrape")
@@ -210,6 +212,30 @@ func main() {
 		fmt.Printf("Unknown command: %s\n", *cmd)
 		os.Exit(1)
 	}
+}
+
+func randomLatentTokens(rng *rand.Rand) (float64, float64) {
+	return rng.Float64()*2.0 - 1.0, rng.Float64()*2.0 - 1.0
+}
+
+func averageDetailedTagsWithLatents(state *simulator.BattleState, depth int, sims int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, rng *rand.Rand) ([simulator.MaxActions]float64, float64, float64) {
+	var acc [simulator.MaxActions]float64
+	reasoningTokenMean := 0.0
+	predictionTokenMean := 0.0
+	for i := 0; i < latentTagEvalRepeats; i++ {
+		latentReasoningToken, latentPredictionToken := randomLatentTokens(rng)
+		reasoningTokenMean += latentReasoningToken
+		predictionTokenMean += latentPredictionToken
+		tags := bot.GetDetailedTagsWithBudgetAndLatents(state, depth, sims, mlpCache, attentionCache, tt, latentReasoningToken, latentPredictionToken)
+		for action := 0; action < simulator.MaxActions; action++ {
+			acc[action] += tags[action]
+		}
+	}
+	inv := 1.0 / float64(latentTagEvalRepeats)
+	for action := 0; action < simulator.MaxActions; action++ {
+		acc[action] *= inv
+	}
+	return acc, reasoningTokenMean * inv, predictionTokenMean * inv
 }
 
 func runParseCommand(inDir string) error {
@@ -1037,6 +1063,7 @@ func runMixedTrainCommand(inDir string, taggedDir string, testDir string, search
 			for i := 0; i < simulator.MaxActions; i++ {
 				targets[i] = -1.0
 			}
+			latentReasoningToken, latentPredictionToken := randomLatentTokens(rng)
 
 			isSearchTag := rng.Float64() < searchRatio
 			if !isSearchTag && replay.Events[eventIdx].Turn <= 10 {
@@ -1045,7 +1072,9 @@ func runMixedTrainCommand(inDir string, taggedDir string, testDir string, search
 			}
 
 			if isSearchTag {
-				detailedTags := bot.GetDetailedTagsWithBudget(state, searchDepth, baseSims, mlpCache, attentionCache, tt)
+				detailedTags, meanReasoning, meanPrediction := averageDetailedTagsWithLatents(state, searchDepth, baseSims, mlpCache, attentionCache, tt, rng)
+				latentReasoningToken = meanReasoning
+				latentPredictionToken = meanPrediction
 				_, margin := topTwoSearchScores(validActions, validLen, detailedTags)
 				isUncertain := margin <= hardMargin
 				isLateGame := totalAliveInState(state) <= 4
@@ -1056,7 +1085,9 @@ func runMixedTrainCommand(inDir string, taggedDir string, testDir string, search
 					if retagDepth == 0 {
 						retagDepth = searchDepth + 1
 					}
-					detailedTags = bot.GetDetailedTagsWithBudget(state, retagDepth, hardSims, mlpCache, attentionCache, tt)
+					detailedTags, meanReasoning, meanPrediction = averageDetailedTagsWithLatents(state, retagDepth, hardSims, mlpCache, attentionCache, tt, rng)
+					latentReasoningToken = meanReasoning
+					latentPredictionToken = meanPrediction
 					hardRetags++
 					if isUncertain {
 						hardRetagsUncertain++
@@ -1088,7 +1119,7 @@ func runMixedTrainCommand(inDir string, taggedDir string, testDir string, search
 				targets[chosenAction] = matchWinner
 			}
 
-			tagged, _, ok := evaluator.BuildTaggedSampleFromState(state, targets, eloWeight, isSearchTag)
+			tagged, _, ok := evaluator.BuildTaggedSampleFromStateWithLatents(state, targets, eloWeight, isSearchTag, latentReasoningToken, latentPredictionToken)
 			if !ok {
 				skippedPositions++
 				continue
@@ -1218,6 +1249,7 @@ func runTagReplaysCommand(inDir string, taggedDir string, searchDepth int) error
 	taggedCount := 0
 	totalPositions := 0
 	skippedPositions := 0
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
@@ -1266,7 +1298,7 @@ func runTagReplaysCommand(inDir string, taggedDir string, searchDepth int) error
 				continue
 			}
 
-			detailedTags := bot.GetDetailedTags(state, searchDepth, mlpCache, attentionCache, tt)
+			detailedTags, meanReasoning, meanPrediction := averageDetailedTagsWithLatents(state, searchDepth, 0, mlpCache, attentionCache, tt, rng)
 			targets := make([]float64, simulator.MaxActions)
 			for i := 0; i < simulator.MaxActions; i++ {
 				targets[i] = -1.0
@@ -1278,7 +1310,7 @@ func runTagReplaysCommand(inDir string, taggedDir string, searchDepth int) error
 				}
 			}
 
-			tagged, _, ok := evaluator.BuildTaggedSampleFromState(state, targets, eloWeight, true)
+			tagged, _, ok := evaluator.BuildTaggedSampleFromStateWithLatents(state, targets, eloWeight, true, meanReasoning, meanPrediction)
 			if !ok {
 				skippedPositions++
 				continue

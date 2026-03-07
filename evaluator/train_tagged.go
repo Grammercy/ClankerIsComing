@@ -158,7 +158,7 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		fmt.Println("Starting MoE router from scratch...")
 	}
 
-	learningRate := 0.001
+	learningRate := 0.05
 	bestMetric := math.MaxFloat64
 	patienceCounter := 0
 	startEpoch := 1
@@ -174,6 +174,8 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		attentionMLP.AdamStep = state.AttnAdamStep
 	}
 
+	const rapidLRDecay = 0.4
+	const normalScheduleLR = 0.001
 	const patience = 3
 	const lrDecay = 0.5
 	const minLR = 1e-5
@@ -348,7 +350,20 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 			patienceCounter++
 		}
 
-		if patienceCounter >= patience && learningRate > minLR {
+		if learningRate > normalScheduleLR {
+			nextLR := learningRate * rapidLRDecay
+			if nextLR < normalScheduleLR {
+				nextLR = normalScheduleLR
+			}
+			if nextLR != learningRate {
+				fmt.Printf("  -> Rapid LR decay: %.6f -> %.6f\n", learningRate, nextLR)
+			}
+			if nextLR == normalScheduleLR {
+				patienceCounter = 0
+				fmt.Printf("  -> Switched to normal plateau LR schedule at %.6f\n", nextLR)
+			}
+			learningRate = nextLR
+		} else if patienceCounter >= patience && learningRate > minLR {
 			learningRate *= lrDecay
 			if learningRate < minLR {
 				learningRate = minLR
