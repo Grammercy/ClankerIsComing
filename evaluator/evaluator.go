@@ -63,12 +63,22 @@ func HashFeatures(f *[TotalFeatures]float64) uint64 {
 
 func InitEvaluator() {
 	if !MLPLoadAttempted {
-		GlobalMLP = NewMLP([]int{TotalFeatures, 1024, 512, 256, simulator.MaxActions})
-		GlobalAttentionMLP = NewMLP([]int{TotalSlotFeatures, 256, 128, 12})
+		mainSizes := mainMLPLayerSizes()
+		attnSizes := attentionMLPLayerSizes()
+		GlobalMLP = NewMLP(mainSizes)
+		GlobalAttentionMLP = NewMLP(attnSizes)
 		GlobalAttentionMLP.LinearOutput = true
 
-		if err := GlobalMLP.LoadWeights("evaluator_weights.json"); err == nil {
-			GlobalAttentionMLP.LoadWeights("attention_weights.json")
+		mainOk := false
+		if err := GlobalMLP.LoadWeights("evaluator_weights.json"); err == nil && GlobalMLP.HasLayerSizes(mainSizes) {
+			mainOk = true
+		}
+
+		if mainOk {
+			if err := GlobalAttentionMLP.LoadWeights("attention_weights.json"); err != nil || !GlobalAttentionMLP.HasLayerSizes(attnSizes) {
+				GlobalAttentionMLP = NewMLP(attnSizes)
+				GlobalAttentionMLP.LinearOutput = true
+			}
 		} else {
 			GlobalMLP = nil
 			GlobalAttentionMLP = nil
@@ -107,7 +117,7 @@ func EvaluateAll(state *simulator.BattleState, mlpCache *InferenceCache, attenti
 	return result
 }
 
-// AttentionWeights returns the softmax-normalized 12-slot attention weights
+// AttentionWeights returns the MoE-composed softmax-normalized 12-slot attention weights
 // (P1 slots 0-5 followed by P2 slots 0-5) used during vectorization.
 // The bool return is false when the attention network is unavailable.
 func AttentionWeights(state *simulator.BattleState, cache *InferenceCache) ([12]float64, bool) {
@@ -128,27 +138,12 @@ func AttentionWeights(state *simulator.BattleState, cache *InferenceCache) ([12]
 	rawSlots = append(rawSlots, p2Slots[:]...)
 
 	rawAttention := GlobalAttentionMLP.Forward(rawSlots, cache)
-	if len(rawAttention) < len(weights) {
+	moeWeights, ok := attentionWeightsFromMoEOutput(rawAttention)
+	if !ok {
 		return weights, false
 	}
-
-	maxScore := -math.MaxFloat64
 	for i := 0; i < len(weights); i++ {
-		if rawAttention[i] > maxScore {
-			maxScore = rawAttention[i]
-		}
-	}
-
-	sumExp := 0.0
-	for i := 0; i < len(weights); i++ {
-		weights[i] = math.Exp(rawAttention[i] - maxScore)
-		sumExp += weights[i]
-	}
-	if sumExp <= 0 {
-		return weights, false
-	}
-	for i := range weights {
-		weights[i] /= sumExp
+		weights[i] = moeWeights[i]
 	}
 	return weights, true
 }
@@ -270,30 +265,18 @@ func EvaluateBatchStates(states []simulator.BattleState) []float64 {
 	}
 
 	if GlobalAttentionMLP != nil {
-		rawAttentionBatch := GlobalAttentionMLP.ForwardBatch(rawSlotsBatch)
-		for sampleIdx, rawAttention := range rawAttentionBatch {
-			weights := make([]float64, len(rawAttention))
-			maxScore := -math.MaxFloat64
-			for _, score := range rawAttention {
-				if score > maxScore {
-					maxScore = score
-				}
-			}
-			sumExp := 0.0
-			for i, score := range rawAttention {
-				weights[i] = math.Exp(score - maxScore)
-				sumExp += weights[i]
-			}
-			if sumExp > 0 {
-				for i := range weights {
-					weights[i] /= sumExp
-				}
+		rawMoEBatch := GlobalAttentionMLP.ForwardBatch(rawSlotsBatch)
+		defaultWeights := uniformSlotWeights()
+		for sampleIdx, rawMoE := range rawMoEBatch {
+			slotWeights, ok := attentionWeightsFromMoEOutput(rawMoE)
+			if !ok {
+				slotWeights = defaultWeights
 			}
 
 			dst := mainInputs[sampleIdx][TotalGlobals:]
 			src := rawSlotsBatch[sampleIdx]
-			for slotIdx := 0; slotIdx < len(weights); slotIdx++ {
-				w := weights[slotIdx]
+			for slotIdx := 0; slotIdx < SlotAttentionSlots; slotIdx++ {
+				w := slotWeights[slotIdx]
 				base := slotIdx * FeaturesPerSlot
 				for j := 0; j < FeaturesPerSlot; j++ {
 					dst[base+j] = src[base+j] * w
@@ -380,30 +363,16 @@ func Vectorize(state *simulator.BattleState, attention *MLP, out *[TotalFeatures
 		idx++
 	}
 
-	// Apply Self-Attention if network is provided
+	// Apply MoE slot routing if network is provided
 	if attention != nil {
-		rawAttention := attention.Forward(out[slotsStartIdx:idx], cache)
-
-		// Softmax the 12 scores
-		attentionWeights := make([]float64, 12)
-		maxScore := -math.MaxFloat64
-		for _, score := range rawAttention {
-			if score > maxScore {
-				maxScore = score
-			}
-		}
-
-		sumExp := 0.0
-		for i, score := range rawAttention {
-			attentionWeights[i] = math.Exp(score - maxScore)
-			sumExp += attentionWeights[i]
-		}
-		for i := range attentionWeights {
-			attentionWeights[i] /= sumExp
+		rawMoE := attention.Forward(out[slotsStartIdx:idx], cache)
+		attentionWeights, ok := attentionWeightsFromMoEOutput(rawMoE)
+		if !ok {
+			attentionWeights = uniformSlotWeights()
 		}
 
 		// Multiply slot features by their respective Attention Weights in-place
-		for slotIdx := 0; slotIdx < 12; slotIdx++ {
+		for slotIdx := 0; slotIdx < SlotAttentionSlots; slotIdx++ {
 			weight := attentionWeights[slotIdx]
 			baseIdx := slotsStartIdx + (slotIdx * FeaturesPerSlot)
 			for j := 0; j < FeaturesPerSlot; j++ {

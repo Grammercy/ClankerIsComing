@@ -34,6 +34,23 @@ type MLP struct {
 	gpu *openclMLPBackend
 }
 
+func (mlp *MLP) HasLayerSizes(sizes []int) bool {
+	if mlp == nil || len(sizes) < 2 || len(mlp.Layers) != len(sizes)-1 {
+		return false
+	}
+	for i, layer := range mlp.Layers {
+		if len(layer.Weights) != sizes[i+1] || len(layer.Biases) != sizes[i+1] {
+			return false
+		}
+		for _, row := range layer.Weights {
+			if len(row) != sizes[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // NewMLP initializes an MLP with the given layer sizes.
 func NewMLP(sizes []int) *MLP {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))

@@ -118,27 +118,16 @@ func tuneKernelBatchSize(mlp *MLP, attentionMLP *MLP) int {
 	mainInputs := make([][]float64, maxBatch)
 	mainTargets := make([][]float64, maxBatch)
 	attnInputs := make([][]float64, maxBatch)
-	attnWeights := make([][]float64, maxBatch)
 	sampleWeights := make([]float64, maxBatch)
 	for s := 0; s < maxBatch; s++ {
 		mainRow := make([]float64, TotalFeatures)
 		targetRow := make([]float64, simulator.MaxActions)
 		attnRow := make([]float64, TotalSlotFeatures)
-		weightsRow := make([]float64, 12)
 		for i := 0; i < TotalFeatures; i++ {
 			mainRow[i] = float64(((s+1)*(i+3))%29) / 29.0
 		}
 		for i := 0; i < TotalSlotFeatures; i++ {
 			attnRow[i] = float64(((s+2)*(i+5))%31) / 31.0
-		}
-		sum := 0.0
-		for i := 0; i < 12; i++ {
-			w := float64(((s+3)*(i+7))%37 + 1)
-			weightsRow[i] = w
-			sum += w
-		}
-		for i := 0; i < 12; i++ {
-			weightsRow[i] /= sum
 		}
 		for i := 0; i < simulator.MaxActions; i++ {
 			if i%3 == 0 {
@@ -150,7 +139,6 @@ func tuneKernelBatchSize(mlp *MLP, attentionMLP *MLP) int {
 		mainInputs[s] = mainRow
 		mainTargets[s] = targetRow
 		attnInputs[s] = attnRow
-		attnWeights[s] = weightsRow
 		sampleWeights[s] = 1.0
 	}
 
@@ -159,18 +147,48 @@ func tuneKernelBatchSize(mlp *MLP, attentionMLP *MLP) int {
 
 	fmt.Printf("Auto-tuning OpenCL kernel batch size using train-step kernels (max=%d)...\n", maxBatch)
 	for _, batch := range candidates {
+		runOneStep := func() {
+			rawMoEBatch := attentionMLP.ForwardBatch(attnInputs[:batch])
+			slotWeightsBatch := make([][]float64, batch)
+			defaultWeights := uniformSlotWeights()
+			for i, rawMoE := range rawMoEBatch {
+				slotWeights, ok := attentionWeightsFromMoEOutput(rawMoE)
+				if !ok {
+					slotWeights = defaultWeights
+				}
+				row := make([]float64, SlotAttentionSlots)
+				copy(row, slotWeights[:])
+				slotWeightsBatch[i] = row
+			}
+
+			_ = mlp.CalculateBCELocalGradientsBatch(mainInputs[:batch], mainTargets[:batch], sampleWeights[:batch])
+			slotDeltaFlat := mlp.AttentionOutputDeltasFromFirstLayerBatch(
+				TotalGlobals,
+				attnInputs[:batch],
+				slotWeightsBatch,
+				sampleWeights[:batch],
+				FeaturesPerSlot,
+				SlotAttentionSlots,
+			)
+			slotDeltaBatch := make([][]float64, batch)
+			for i := 0; i < batch; i++ {
+				base := i * SlotAttentionSlots
+				row := make([]float64, SlotAttentionSlots)
+				copy(row, slotDeltaFlat[base:base+SlotAttentionSlots])
+				slotDeltaBatch[i] = row
+			}
+			moeDeltas, _ := buildMoEOutputDeltasBatch(rawMoEBatch, slotDeltaBatch, sampleWeights[:batch], SlotMoEBalanceLossScale)
+			attentionMLP.BackpropGivenDeltasBatch(attnInputs[:batch], moeDeltas, sampleWeights[:batch])
+		}
+
 		// Warm up driver caches and command submission paths with a real train-step batch.
-		_ = mlp.CalculateBCELocalGradientsBatch(mainInputs[:batch], mainTargets[:batch], sampleWeights[:batch])
-		warmGrads := mlp.FirstLayerInputGradSliceBatch(TotalGlobals, TotalSlotFeatures, batch)
-		attentionMLP.BackpropAttentionFromInputGradsBatch(attnInputs[:batch], attnWeights[:batch], warmGrads, sampleWeights[:batch], FeaturesPerSlot)
+		runOneStep()
 		mlp.ClearGradients()
 		attentionMLP.ClearGradients()
 
 		start := time.Now()
 		for i := 0; i < kernelTuneIterations; i++ {
-			_ = mlp.CalculateBCELocalGradientsBatch(mainInputs[:batch], mainTargets[:batch], sampleWeights[:batch])
-			grads := mlp.FirstLayerInputGradSliceBatch(TotalGlobals, TotalSlotFeatures, batch)
-			attentionMLP.BackpropAttentionFromInputGradsBatch(attnInputs[:batch], attnWeights[:batch], grads, sampleWeights[:batch], FeaturesPerSlot)
+			runOneStep()
 		}
 		elapsed := time.Since(start)
 		mlp.ClearGradients()
@@ -201,6 +219,8 @@ type preparedSnapshot struct {
 
 type gpuEpochStats struct {
 	totalLoss      float64
+	totalBCELoss   float64
+	totalBalance   float64
 	validSnapshots int
 }
 
@@ -493,6 +513,7 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 	stats := gpuEpochStats{}
 	workerBatchCount := 0
 	batch := make([]preparedSnapshot, 0, kernelBatchSize)
+	defaultWeights := uniformSlotWeights()
 
 	flushKernelBatch := func() {
 		n := len(batch)
@@ -509,37 +530,21 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 			eloWeightsBatch[i] = sample.eloWeight
 		}
 
-		rawAttentionBatch := attentionMLP.ForwardBatch(rawSlotsBatch)
+		rawMoEBatch := attentionMLP.ForwardBatch(rawSlotsBatch)
 		attentionWeightsBatch := make([][]float64, n)
 		mainInputsBatch := make([][]float64, n)
-		attentionSlotCount := 0
 		for sampleIdx, sample := range batch {
-			rawAttention := rawAttentionBatch[sampleIdx]
-			if attentionSlotCount == 0 {
-				attentionSlotCount = len(rawAttention)
+			slotWeights, ok := attentionWeightsFromMoEOutput(rawMoEBatch[sampleIdx])
+			if !ok {
+				slotWeights = defaultWeights
 			}
-			attentionWeights := make([]float64, len(rawAttention))
-			maxScore := -math.MaxFloat64
-			for _, score := range rawAttention {
-				if score > maxScore {
-					maxScore = score
-				}
-			}
-			sumExp := 0.0
-			for i, score := range rawAttention {
-				attentionWeights[i] = math.Exp(score - maxScore)
-				sumExp += attentionWeights[i]
-			}
-			if sumExp > 0 {
-				for i := range attentionWeights {
-					attentionWeights[i] /= sumExp
-				}
-			}
+			attentionWeights := make([]float64, SlotAttentionSlots)
+			copy(attentionWeights, slotWeights[:])
 
 			mainInputs := make([]float64, TotalFeatures)
 			copy(mainInputs, sample.prefix)
 			idx := TotalGlobals
-			for slotIdx := 0; slotIdx < len(attentionWeights); slotIdx++ {
+			for slotIdx := 0; slotIdx < SlotAttentionSlots; slotIdx++ {
 				w := attentionWeights[slotIdx]
 				base := slotIdx * FeaturesPerSlot
 				for j := 0; j < FeaturesPerSlot; j++ {
@@ -552,8 +557,7 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 			mainInputsBatch[sampleIdx] = mainInputs
 		}
 
-		batchLoss := mlp.CalculateBCELocalGradientsBatch(mainInputsBatch, targetsBatch, eloWeightsBatch)
-		stats.totalLoss += batchLoss
+		bceLoss := mlp.CalculateBCELocalGradientsBatch(mainInputsBatch, targetsBatch, eloWeightsBatch)
 		stats.validSnapshots += n
 
 		attentionDeltaFlat := mlp.AttentionOutputDeltasFromFirstLayerBatch(
@@ -562,16 +566,22 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 			attentionWeightsBatch,
 			eloWeightsBatch,
 			FeaturesPerSlot,
-			attentionSlotCount,
+			SlotAttentionSlots,
 		)
-		attentionDeltaBatch := make([][]float64, n)
+		slotDeltaBatch := make([][]float64, n)
 		for sample := 0; sample < n; sample++ {
-			base := sample * attentionSlotCount
-			row := make([]float64, attentionSlotCount)
-			copy(row, attentionDeltaFlat[base:base+attentionSlotCount])
-			attentionDeltaBatch[sample] = row
+			base := sample * SlotAttentionSlots
+			row := make([]float64, SlotAttentionSlots)
+			copy(row, attentionDeltaFlat[base:base+SlotAttentionSlots])
+			slotDeltaBatch[sample] = row
 		}
-		attentionMLP.BackpropGivenDeltasBatch(rawSlotsBatch, attentionDeltaBatch, eloWeightsBatch)
+
+		moeDeltaBatch, balanceLoss := buildMoEOutputDeltasBatch(rawMoEBatch, slotDeltaBatch, eloWeightsBatch, SlotMoEBalanceLossScale)
+		attentionMLP.BackpropGivenDeltasBatch(rawSlotsBatch, moeDeltaBatch, eloWeightsBatch)
+
+		stats.totalBCELoss += bceLoss
+		stats.totalBalance += balanceLoss
+		stats.totalLoss += bceLoss + balanceLoss
 
 		workerBatchCount += n
 		for workerBatchCount >= BatchSize {
@@ -616,21 +626,35 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		return err
 	}
 
-	fmt.Printf("Initializing Main MLP [%d -> 1024 -> 512 -> 256 -> %d]...\n", TotalFeatures, simulator.MaxActions)
-	mlp := NewMLP([]int{TotalFeatures, 1024, 512, 256, simulator.MaxActions})
+	mainSizes := mainMLPLayerSizes()
+	attnSizes := attentionMLPLayerSizes()
+	fmt.Printf("Initializing Main MLP %v (%d params)...\n", mainSizes, mlpParamCount(mainSizes))
+	fmt.Printf("Model total (main + MoE router): %d params\n", totalEvaluatorParamCount())
+	mlp := NewMLP(mainSizes)
 	if err := mlp.LoadWeights("evaluator_weights.json"); err == nil {
-		fmt.Println("Loaded existing evaluator_weights.json...")
+		if mlp.HasLayerSizes(mainSizes) {
+			fmt.Println("Loaded existing evaluator_weights.json...")
+		} else {
+			fmt.Println("Ignoring incompatible evaluator_weights.json (old architecture); starting Main MLP from scratch...")
+			mlp = NewMLP(mainSizes)
+		}
 	} else {
 		fmt.Println("Starting Main MLP from scratch...")
 	}
 
-	fmt.Printf("Initializing Attention MLP [%d -> 256 -> 128 -> 12]...\n", TotalSlotFeatures)
-	attentionMLP := NewMLP([]int{TotalSlotFeatures, 256, 128, 12})
+	fmt.Printf("Initializing MoE Router MLP %v (%d params, %d experts)...\n", attnSizes, mlpParamCount(attnSizes), SlotAttentionExperts)
+	attentionMLP := NewMLP(attnSizes)
 	attentionMLP.LinearOutput = true
 	if err := attentionMLP.LoadWeights("attention_weights.json"); err == nil {
-		fmt.Println("Loaded existing attention_weights.json...")
+		if attentionMLP.HasLayerSizes(attnSizes) {
+			fmt.Println("Loaded existing attention_weights.json...")
+		} else {
+			fmt.Println("Ignoring incompatible attention_weights.json (old architecture); starting MoE router from scratch...")
+			attentionMLP = NewMLP(attnSizes)
+			attentionMLP.LinearOutput = true
+		}
 	} else {
-		fmt.Println("Starting Attention MLP from scratch...")
+		fmt.Println("Starting MoE router from scratch...")
 	}
 
 	learningRate := 0.001
@@ -676,7 +700,7 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		go func() {
 			lastReport := time.Now()
 			for s := range progressCh {
-				if time.Since(lastReport) < 2*time.Second {
+				if time.Since(lastReport) < 1*time.Second {
 					continue
 				}
 				avgLoss := 0.0
@@ -789,13 +813,17 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		}
 		fmt.Printf("\n")
 
-		totalLoss := stats.totalLoss
 		validSnapshots := stats.validSnapshots
+		avgBCE := math.MaxFloat64
+		avgBalance := 0.0
 		avgLoss := math.MaxFloat64
 		if validSnapshots > 0 {
-			avgLoss = totalLoss / float64(validSnapshots)
+			avgBCE = stats.totalBCELoss / float64(validSnapshots)
+			avgBalance = stats.totalBalance / float64(validSnapshots)
+			avgLoss = avgBCE + avgBalance
 		}
-		fmt.Printf("Epoch %d/%d - Average Loss (BCE): %.6f (Trained on %d snapshots, LR: %.6f)\n", epoch, epochs, avgLoss, validSnapshots, learningRate)
+		fmt.Printf("Epoch %d/%d - Average Loss: %.6f (BCE: %.6f, MoE balance: %.6f, snapshots: %d, LR: %.6f)\n",
+			epoch, epochs, avgLoss, avgBCE, avgBalance, validSnapshots, learningRate)
 		epochElapsed := time.Since(epochStart)
 		cumulativeEpochTime += epochElapsed
 		completedEpochs := epoch - startEpoch + 1
