@@ -16,8 +16,11 @@ type Layer struct {
 	Mu      sync.Mutex `json:"-"` // Layer-specific lock to prevent global bottleneck
 	Weights [][]float64
 	Biases  []float64
-	Outputs []float64
-	Deltas  []float64
+	// Hidden layers use running batch statistics for normalization.
+	BNRunningMean []float64
+	BNRunningVar  []float64
+	Outputs       []float64
+	Deltas        []float64
 	// Adam optimizer moment estimates
 	WeightM [][]float64 `json:"-"`
 	WeightV [][]float64 `json:"-"`
@@ -61,14 +64,16 @@ func NewMLP(sizes []int) *MLP {
 		outputSize := sizes[i+1]
 
 		layer := &Layer{
-			Weights: make([][]float64, outputSize),
-			Biases:  make([]float64, outputSize),
-			Outputs: make([]float64, outputSize),
-			Deltas:  make([]float64, outputSize),
-			WeightM: make([][]float64, outputSize),
-			WeightV: make([][]float64, outputSize),
-			BiasM:   make([]float64, outputSize),
-			BiasV:   make([]float64, outputSize),
+			Weights:       make([][]float64, outputSize),
+			Biases:        make([]float64, outputSize),
+			BNRunningMean: make([]float64, outputSize),
+			BNRunningVar:  make([]float64, outputSize),
+			Outputs:       make([]float64, outputSize),
+			Deltas:        make([]float64, outputSize),
+			WeightM:       make([][]float64, outputSize),
+			WeightV:       make([][]float64, outputSize),
+			BiasM:         make([]float64, outputSize),
+			BiasV:         make([]float64, outputSize),
 		}
 
 		variance := math.Sqrt(2.0 / float64(inputSize))
@@ -76,6 +81,7 @@ func NewMLP(sizes []int) *MLP {
 			layer.Weights[j] = make([]float64, inputSize)
 			layer.WeightM[j] = make([]float64, inputSize)
 			layer.WeightV[j] = make([]float64, inputSize)
+			layer.BNRunningVar[j] = 1.0
 			for k := 0; k < inputSize; k++ {
 				layer.Weights[j][k] = rng.NormFloat64() * variance
 			}
@@ -216,7 +222,7 @@ func (mlp *MLP) CalculateBCELocalGradientsBatch(inputsBatch [][]float64, targets
 	mlp.ensureGPU()
 	loss, outputs, err := mlp.gpu.calculateBCELocalGradientsBatch(mlp, inputsBatch, targetsBatch, eloWeights)
 	if err != nil {
-		panic(fmt.Sprintf("OpenCL BCE batch backprop failed: %v", err) )
+		panic(fmt.Sprintf("OpenCL BCE batch backprop failed: %v", err))
 	}
 	return loss, outputs
 }
@@ -342,6 +348,12 @@ func (mlp *MLP) LoadWeights(filename string) error {
 		if len(layer.Deltas) != len(layer.Weights) {
 			layer.Deltas = make([]float64, len(layer.Weights))
 		}
+		if len(layer.BNRunningMean) != len(layer.Weights) {
+			layer.BNRunningMean = make([]float64, len(layer.Weights))
+		}
+		if len(layer.BNRunningVar) != len(layer.Weights) {
+			layer.BNRunningVar = make([]float64, len(layer.Weights))
+		}
 		if len(layer.WeightM) != len(layer.Weights) {
 			layer.WeightM = make([][]float64, len(layer.Weights))
 		}
@@ -360,6 +372,9 @@ func (mlp *MLP) LoadWeights(filename string) error {
 			}
 			if len(layer.WeightV[i]) != len(layer.Weights[i]) {
 				layer.WeightV[i] = make([]float64, len(layer.Weights[i]))
+			}
+			if layer.BNRunningVar[i] == 0 {
+				layer.BNRunningVar[i] = 1
 			}
 		}
 	}
