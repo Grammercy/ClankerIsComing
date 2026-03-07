@@ -440,6 +440,14 @@ type openclMLPBackend struct {
 	lastBatchSize     int
 }
 
+func (b *openclMLPBackend) float32To64(in []float32) []float64 {
+	out := make([]float64, len(in))
+	for i := range in {
+		out[i] = float64(in[i])
+	}
+	return out
+}
+
 func (b *openclMLPBackend) maxBatchSizeLimit() int {
 	if b == nil {
 		return 1
@@ -944,7 +952,9 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		backend.Release()
 		return nil, fmt.Errorf("create scratchB buffer: %w", err)
 	}
-	backend.targetsBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*16)
+	// Targets/output-delta staging buffers must accommodate the widest output
+	// layer (not a fixed action count), since MoE router output can be larger.
+	backend.targetsBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth)
 	if err != nil {
 		backend.Release()
 		return nil, fmt.Errorf("create targets buffer: %w", err)
@@ -959,7 +969,7 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		backend.Release()
 		return nil, fmt.Errorf("create batch input buffer: %w", err)
 	}
-	backend.batchTargetsBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*16*maxBatch)
+	backend.batchTargetsBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth*maxBatch)
 	if err != nil {
 		backend.Release()
 		return nil, fmt.Errorf("create batch targets buffer: %w", err)
@@ -969,7 +979,7 @@ func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
 		backend.Release()
 		return nil, fmt.Errorf("create batch scale buffer: %w", err)
 	}
-	backend.attentionDeltaBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*16*maxBatch)
+	backend.attentionDeltaBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth*maxBatch)
 	if err != nil {
 		backend.Release()
 		return nil, fmt.Errorf("create attention delta buffer: %w", err)
@@ -1436,21 +1446,21 @@ func (b *openclMLPBackend) calculateBCELocalGradients(mlp *MLP, inputs []float64
 	return loss, nil
 }
 
-func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch [][]float64, targetsBatch [][]float64, eloWeights []float64) (float64, error) {
+func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch [][]float64, targetsBatch [][]float64, eloWeights []float64) (float64, [][]float64, error) {
 	batchSize := len(inputsBatch)
 	if batchSize == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 	if len(targetsBatch) != batchSize || len(eloWeights) != batchSize {
-		return 0, fmt.Errorf("batch sizes mismatch: inputs=%d targets=%d weights=%d", batchSize, len(targetsBatch), len(eloWeights))
+		return 0, nil, fmt.Errorf("batch sizes mismatch: inputs=%d targets=%d weights=%d", batchSize, len(targetsBatch), len(eloWeights))
 	}
 	if batchSize > b.maxBatchSize {
-		return 0, fmt.Errorf("batch size %d exceeds OPENCL_MAX_BATCH %d", batchSize, b.maxBatchSize)
+		return 0, nil, fmt.Errorf("batch size %d exceeds OPENCL_MAX_BATCH %d", batchSize, b.maxBatchSize)
 	}
 
 	inSize := len(inputsBatch[0])
 	if inSize > b.workBufSize {
-		return 0, fmt.Errorf("input size %d exceeds OpenCL work buffer %d", inSize, b.workBufSize)
+		return 0, nil, fmt.Errorf("input size %d exceeds OpenCL work buffer %d", inSize, b.workBufSize)
 	}
 
 	b.mu.Lock()
@@ -1458,14 +1468,14 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 
 	for i := 1; i < batchSize; i++ {
 		if len(inputsBatch[i]) != inSize {
-			return 0, fmt.Errorf("input batch element %d has size %d, expected %d", i, len(inputsBatch[i]), inSize)
+			return 0, nil, fmt.Errorf("input batch element %d has size %d, expected %d", i, len(inputsBatch[i]), inSize)
 		}
 	}
 
 	outSize := b.layers[len(b.layers)-1].outSize
 	for i := 0; i < batchSize; i++ {
 		if len(targetsBatch[i]) != outSize {
-			return 0, fmt.Errorf("target batch element %d has size %d, expected %d", i, len(targetsBatch[i]), outSize)
+			return 0, nil, fmt.Errorf("target batch element %d has size %d, expected %d", i, len(targetsBatch[i]), outSize)
 		}
 	}
 
@@ -1477,7 +1487,7 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 		}
 	}
 	if _, err := b.queue.EnqueueWriteBufferFloat32(b.batchInputBuf, false, 0, inFlat, nil); err != nil {
-		return 0, fmt.Errorf("write batch inputs: %w", err)
+		return 0, nil, fmt.Errorf("write batch inputs: %w", err)
 	}
 
 	currentInputBuf := b.batchInputBuf
@@ -1496,10 +1506,10 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 			layer.weights, layer.biases, currentInputBuf, layer.batchOut,
 			int32(currentInputSize), int32(layer.outSize), int32(batchSize), activation,
 		); err != nil {
-			return 0, fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("set dense_forward_batch args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.denseForwardBatchKernel, nil, []int{layer.outSize * batchSize}, nil, nil); err != nil {
-			return 0, fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("enqueue dense_forward_batch layer %d: %w", i, err)
 		}
 
 		currentInputBuf = layer.batchOut
@@ -1508,7 +1518,17 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 
 	outputFlat := make([]float32, batchSize*outSize)
 	if _, err := b.queue.EnqueueReadBufferFloat32(b.layers[len(b.layers)-1].batchOut, true, 0, outputFlat, nil); err != nil {
-		return 0, fmt.Errorf("read batch outputs: %w", err)
+		return 0, nil, fmt.Errorf("read batch outputs: %w", err)
+	}
+
+	outputs64 := make([][]float64, batchSize)
+	for s := 0; s < batchSize; s++ {
+		row := make([]float64, outSize)
+		base := s * outSize
+		for i := 0; i < outSize; i++ {
+			row[i] = float64(outputFlat[base+i])
+		}
+		outputs64[s] = row
 	}
 
 	targetFlat := make([]float32, batchSize*outSize)
@@ -1536,28 +1556,28 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 	}
 
 	if _, err := b.queue.EnqueueWriteBufferFloat32(b.batchTargetsBuf, false, 0, targetFlat, nil); err != nil {
-		return 0, fmt.Errorf("write batch targets: %w", err)
+		return 0, nil, fmt.Errorf("write batch targets: %w", err)
 	}
 	if _, err := b.queue.EnqueueWriteBufferFloat32(b.batchScaleBuf, false, 0, sampleScale, nil); err != nil {
-		return 0, fmt.Errorf("write batch scales: %w", err)
+		return 0, nil, fmt.Errorf("write batch scales: %w", err)
 	}
 
 	last := b.layers[len(b.layers)-1]
 	if err := b.outputDeltaBCEBatchKernel.SetArgs(last.batchOut, b.batchTargetsBuf, b.batchScaleBuf, last.batchDel, int32(outSize), int32(batchSize)); err != nil {
-		return 0, fmt.Errorf("set output_delta_bce_batch args: %w", err)
+		return 0, nil, fmt.Errorf("set output_delta_bce_batch args: %w", err)
 	}
 	if _, err := b.queue.EnqueueNDRangeKernel(b.outputDeltaBCEBatchKernel, nil, []int{outSize * batchSize}, nil, nil); err != nil {
-		return 0, fmt.Errorf("enqueue output_delta_bce_batch: %w", err)
+		return 0, nil, fmt.Errorf("enqueue output_delta_bce_batch: %w", err)
 	}
 
 	for i := len(b.layers) - 2; i >= 0; i-- {
 		cur := b.layers[i]
 		next := b.layers[i+1]
 		if err := b.hiddenDeltaBatchKernel.SetArgs(next.weights, next.batchDel, cur.batchOut, cur.batchDel, int32(cur.outSize), int32(next.outSize), int32(batchSize)); err != nil {
-			return 0, fmt.Errorf("set hidden_delta_batch args layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("set hidden_delta_batch args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.hiddenDeltaBatchKernel, nil, []int{cur.outSize * batchSize}, nil, nil); err != nil {
-			return 0, fmt.Errorf("enqueue hidden_delta_batch layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("enqueue hidden_delta_batch layer %d: %w", i, err)
 		}
 	}
 
@@ -1571,22 +1591,22 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 
 		weightCount := layer.inSize * layer.outSize
 		if err := b.accWeightGradsBatchKernel.SetArgs(layer.batchDel, inputBuf, layer.gradWBuf, int32(inputSize), int32(layer.outSize), int32(batchSize)); err != nil {
-			return 0, fmt.Errorf("set accumulate_weight_grads_batch args layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("set accumulate_weight_grads_batch args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.accWeightGradsBatchKernel, nil, []int{weightCount}, nil, nil); err != nil {
-			return 0, fmt.Errorf("enqueue accumulate_weight_grads_batch layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("enqueue accumulate_weight_grads_batch layer %d: %w", i, err)
 		}
 
 		if err := b.accBiasGradsBatchKernel.SetArgs(layer.batchDel, layer.gradBBuf, int32(layer.outSize), int32(batchSize)); err != nil {
-			return 0, fmt.Errorf("set accumulate_bias_grads_batch args layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("set accumulate_bias_grads_batch args layer %d: %w", i, err)
 		}
 		if _, err := b.queue.EnqueueNDRangeKernel(b.accBiasGradsBatchKernel, nil, []int{layer.outSize}, nil, nil); err != nil {
-			return 0, fmt.Errorf("enqueue accumulate_bias_grads_batch layer %d: %w", i, err)
+			return 0, nil, fmt.Errorf("enqueue accumulate_bias_grads_batch layer %d: %w", i, err)
 		}
 	}
 
 	b.lastBatchSize = batchSize
-	return totalLoss, nil
+	return totalLoss, outputs64, nil
 }
 
 func (b *openclMLPBackend) backpropGivenDeltas(mlp *MLP, inputs []float64, outputDeltas []float64, eloWeight float64, cache *WorkerCache) error {

@@ -212,13 +212,13 @@ func (mlp *MLP) CalculateBCELocalGradients(inputs []float64, targets []float64, 
 	return loss
 }
 
-func (mlp *MLP) CalculateBCELocalGradientsBatch(inputsBatch [][]float64, targetsBatch [][]float64, eloWeights []float64) float64 {
+func (mlp *MLP) CalculateBCELocalGradientsBatch(inputsBatch [][]float64, targetsBatch [][]float64, eloWeights []float64) (float64, [][]float64) {
 	mlp.ensureGPU()
-	loss, err := mlp.gpu.calculateBCELocalGradientsBatch(mlp, inputsBatch, targetsBatch, eloWeights)
+	loss, outputs, err := mlp.gpu.calculateBCELocalGradientsBatch(mlp, inputsBatch, targetsBatch, eloWeights)
 	if err != nil {
-		panic(fmt.Sprintf("OpenCL BCE batch backprop failed: %v", err))
+		panic(fmt.Sprintf("OpenCL BCE batch backprop failed: %v", err) )
 	}
-	return loss
+	return loss, outputs
 }
 
 func (mlp *MLP) BackpropGivenDeltas(inputs []float64, outputDeltas []float64, eloWeight float64, cache *WorkerCache) {

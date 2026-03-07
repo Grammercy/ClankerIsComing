@@ -11,11 +11,12 @@ const TaggedReplayVersion = 1
 type TaggedSample struct {
 	Prefix      []float64 `json:"prefix"`
 	RawSlots    []float64 `json:"rawSlots"`
-	Targets     []float64 `json:"targets"`
-	EloWeight   float64   `json:"eloWeight"`
-	Turn        int       `json:"turn,omitempty"`
-	EventIdx    int       `json:"eventIdx,omitempty"`
-	IsSearchTag bool      `json:"isSearchTag,omitempty"`
+	Targets      []float64 `json:"targets"`
+	ValidActions []int     `json:"validActions,omitempty"`
+	EloWeight    float64   `json:"eloWeight"`
+	Turn         int       `json:"turn,omitempty"`
+	EventIdx     int       `json:"eventIdx,omitempty"`
+	IsSearchTag  bool      `json:"isSearchTag,omitempty"`
 }
 
 type TaggedReplayDataset struct {
@@ -44,6 +45,10 @@ func BuildTaggedSampleFromState(state *simulator.BattleState, targets []float64,
 	p1Globals, p1Slots := vectorizePlayerFeatures(&state.P1, state)
 	p2Globals, p2Slots := vectorizePlayerFeatures(&state.P2, state)
 
+	va, nVa := simulator.GetSearchActions(&state.P1)
+	validActions := make([]int, nVa)
+	copy(validActions, va[:nVa])
+
 	rawSlots := make([]float64, 0, TotalSlotFeatures)
 	rawSlots = append(rawSlots, p1Slots[:]...)
 	rawSlots = append(rawSlots, p2Slots[:]...)
@@ -66,11 +71,12 @@ func BuildTaggedSampleFromState(state *simulator.BattleState, targets []float64,
 	vectorizeMatchup(state, &prefixArr, &idx)
 
 	return TaggedSample{
-		Prefix:      append([]float64(nil), prefixArr[:TotalGlobals]...),
-		RawSlots:    rawSlots,
-		Targets:     append([]float64(nil), targets...),
-		EloWeight:   eloWeight,
-		IsSearchTag: isSearchTag,
+		Prefix:       append([]float64(nil), prefixArr[:TotalGlobals]...),
+		RawSlots:     rawSlots,
+		Targets:      append([]float64(nil), targets...),
+		ValidActions: validActions,
+		EloWeight:    eloWeight,
+		IsSearchTag:  isSearchTag,
 	}, "", true
 }
 
@@ -84,12 +90,22 @@ func taggedSampleToPrepared(sample TaggedSample) (preparedSnapshot, error) {
 	if len(sample.Targets) != simulator.MaxActions {
 		return preparedSnapshot{}, fmt.Errorf("invalid targets length %d (expected %d)", len(sample.Targets), simulator.MaxActions)
 	}
+	validActions := sample.ValidActions
+	if len(validActions) == 0 {
+		for i, t := range sample.Targets {
+			if t >= 0.0 {
+				validActions = append(validActions, i)
+			}
+		}
+	}
+	
 	return preparedSnapshot{
-		prefix:      append([]float64(nil), sample.Prefix...),
-		rawSlots:    append([]float64(nil), sample.RawSlots...),
-		targets:     append([]float64(nil), sample.Targets...),
-		eloWeight:   sample.EloWeight,
-		isSearchTag: sample.IsSearchTag,
-		turn:        sample.Turn,
+		prefix:       append([]float64(nil), sample.Prefix...),
+		rawSlots:     append([]float64(nil), sample.RawSlots...),
+		targets:      append([]float64(nil), sample.Targets...),
+		validActions: validActions,
+		eloWeight:    sample.EloWeight,
+		isSearchTag:  sample.IsSearchTag,
+		turn:         sample.Turn,
 	}, nil
 }
