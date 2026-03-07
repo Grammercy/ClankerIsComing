@@ -141,24 +141,6 @@ type WorkerCache struct {
 	BiasGradients   [][]float64
 }
 
-func NewWorkerCache(mlp *MLP) *WorkerCache {
-	c := &WorkerCache{
-		Outputs:         make([][]float64, len(mlp.Layers)),
-		Deltas:          make([][]float64, len(mlp.Layers)),
-		WeightGradients: make([][][]float64, len(mlp.Layers)),
-		BiasGradients:   make([][]float64, len(mlp.Layers)),
-	}
-	for i, layer := range mlp.Layers {
-		c.Outputs[i] = make([]float64, len(layer.Outputs))
-		c.Deltas[i] = make([]float64, len(layer.Deltas))
-		c.BiasGradients[i] = make([]float64, len(layer.Biases))
-		c.WeightGradients[i] = make([][]float64, len(layer.Weights))
-		for j := range layer.Weights {
-			c.WeightGradients[i][j] = make([]float64, len(layer.Weights[j]))
-		}
-	}
-	return c
-}
 
 func (mlp *MLP) ensureGPU() {
 	// Re-initialization attempt if nil, but don't panic
