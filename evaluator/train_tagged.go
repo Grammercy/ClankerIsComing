@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokemon-engine/gamedata"
@@ -89,7 +90,7 @@ func evaluateReplaySetBCE(testDir string, mlp *MLP, attentionMLP *MLP) (float64,
 			matchWinner = 0.0
 		}
 
-		samples, _ := buildReplayChosenActionSamples(replay, matchWinner, 1.0)
+		samples, _ := buildReplayChosenActionSamples(replay, matchWinner, 1.0, 0)
 		for _, sample := range samples {
 			mainInputs := buildInputFromPrepared(sample, attentionMLP)
 			output := mlp.Forward(mainInputs, nil)
@@ -208,8 +209,8 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 				}
 				elapsed := time.Since(epochStart)
 				rate := float64(s.validSnapshots) / elapsed.Seconds()
-				fmt.Printf("\r  -> Progress: %d snapshots | Avg Loss: %.6f | Speed: %.0f/s        ",
-					s.validSnapshots, avgLoss, rate)
+				fmt.Printf("\r  -> Progress: %d snapshots | Loss: %.6f | W/L: E:%.1f%% M:%.1f%% L:%.1f%% | Speed: %.0f/s        ",
+					s.validSnapshots, avgLoss, s.PhaseAccuracy[0]*100, s.PhaseAccuracy[1]*100, s.PhaseAccuracy[2]*100, rate)
 				lastReport = time.Now()
 			}
 		}()
@@ -248,6 +249,14 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 					}
 					local.filesLoaded++
 
+					maxTurn := 0
+					for _, tagged := range dataset.Samples {
+						if tagged.Turn > maxTurn {
+							maxTurn = tagged.Turn
+						}
+					}
+
+					gameID := atomic.AddUint64(&globalGameCounter, 1)
 					for _, tagged := range dataset.Samples {
 						if !tagged.IsSearchTag && tagged.Turn <= 10 {
 							local.samplesSkipped++
@@ -257,6 +266,10 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 						if err != nil {
 							local.samplesSkipped++
 							continue
+						}
+						prepared.GameID = gameID
+						if maxTurn > 0 {
+							prepared.TurnPercent = float64(tagged.Turn) / float64(maxTurn)
 						}
 						samples <- prepared
 						local.samplesLoaded++

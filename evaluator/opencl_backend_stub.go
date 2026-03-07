@@ -32,8 +32,8 @@ func (b *openclMLPBackend) calculateBCELocalGradients(_ *MLP, _ []float64, _ []f
 	return 0, fmt.Errorf("OpenCL backend unavailable in non-opencl build")
 }
 
-func (b *openclMLPBackend) calculateBCELocalGradientsBatch(_ *MLP, _ [][]float64, _ [][]float64, _ []float64) (float64, error) {
-	return 0, fmt.Errorf("OpenCL backend unavailable in non-opencl build")
+func (b *openclMLPBackend) calculateBCELocalGradientsBatch(_ *MLP, _ [][]float64, _ [][]float64, _ []float64) (float64, [][]float64, error) {
+	return 0, nil, fmt.Errorf("OpenCL backend unavailable in non-opencl build")
 }
 
 func (b *openclMLPBackend) backpropGivenDeltas(_ *MLP, _ []float64, _ []float64, _ float64, _ *WorkerCache) error {

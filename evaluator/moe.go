@@ -4,13 +4,16 @@ import "math"
 
 const (
 	SlotAttentionSlots      = 12
-	SlotAttentionExperts    = 4
+	SlotAttentionExperts    = 16
 	SlotMoEOutputSize       = SlotAttentionExperts*SlotAttentionSlots + SlotAttentionExperts
 	SlotMoEBalanceLossScale = 0.02
 )
 
 func attentionMLPLayerSizes() []int {
-	return []int{TotalSlotFeatures, 256, 128, SlotMoEOutputSize}
+	// Keep router parameter count constant after increasing experts to 16.
+	// Old (4 experts): [960, 256, 128, 52] => 285,620 params
+	// New (16 experts): [960, 82, 710, 208] => 285,620 params
+	return []int{TotalSlotFeatures, 82, 710, SlotMoEOutputSize}
 }
 
 func softmax(logits []float64, probs []float64) bool {
@@ -51,6 +54,25 @@ func uniformSlotWeights() [SlotAttentionSlots]float64 {
 	return weights
 }
 
+func top2Experts(gateProbs *[SlotAttentionExperts]float64) (int, int) {
+	best1 := 0
+	best2 := -1
+	for i := 1; i < SlotAttentionExperts; i++ {
+		if gateProbs[i] > gateProbs[best1] {
+			best2 = best1
+			best1 = i
+			continue
+		}
+		if best2 == -1 || gateProbs[i] > gateProbs[best2] {
+			best2 = i
+		}
+	}
+	if best2 == -1 {
+		best2 = best1
+	}
+	return best1, best2
+}
+
 func decodeMoERouting(
 	raw []float64,
 	slotWeights *[SlotAttentionSlots]float64,
@@ -78,12 +100,10 @@ func decodeMoERouting(
 		return false
 	}
 
+	top1, top2 := top2Experts(gateProbs)
 	var mixedSlotLogits [SlotAttentionSlots]float64
 	for slot := 0; slot < SlotAttentionSlots; slot++ {
-		v := 0.0
-		for expert := 0; expert < SlotAttentionExperts; expert++ {
-			v += gateProbs[expert] * expertLogits[expert][slot]
-		}
+		v := 0.5 * (expertLogits[top1][slot] + expertLogits[top2][slot])
 		mixedSlotLogits[slot] = v
 	}
 	if !softmax(mixedSlotLogits[:], slotWeights[:]) {
@@ -115,13 +135,13 @@ func buildMoEOutputDeltasBatch(
 	}
 
 	gateBatch := make([][SlotAttentionExperts]float64, n)
-	expertBatch := make([][SlotAttentionExperts][SlotAttentionSlots]float64, n)
 
 	totalSampleWeight := 0.0
 	var gateUsage [SlotAttentionExperts]float64
 	for i := 0; i < n; i++ {
 		var slotWeights [SlotAttentionSlots]float64
-		if !decodeMoERouting(rawMoEBatch[i], &slotWeights, &gateBatch[i], &expertBatch[i]) {
+		var expertLogits [SlotAttentionExperts][SlotAttentionSlots]float64
+		if !decodeMoERouting(rawMoEBatch[i], &slotWeights, &gateBatch[i], &expertLogits) {
 			for expert := 0; expert < SlotAttentionExperts; expert++ {
 				gateBatch[i][expert] = 1.0 / float64(SlotAttentionExperts)
 			}
@@ -167,19 +187,19 @@ func buildMoEOutputDeltasBatch(
 			slotDeltas = tmp
 		}
 
-		var gateProbDeltas [SlotAttentionExperts]float64
+		top1, top2 := top2Experts(&gateBatch[i])
 		for expert := 0; expert < SlotAttentionExperts; expert++ {
 			base := expert * SlotAttentionSlots
-			g := gateBatch[i][expert]
-			dot := 0.0
-			for slot := 0; slot < SlotAttentionSlots; slot++ {
-				delta := g * slotDeltas[slot]
-				row[base+slot] = delta
-				dot += slotDeltas[slot] * expertBatch[i][expert][slot]
+			share := 0.0
+			if expert == top1 || expert == top2 {
+				share = 0.5
 			}
-			gateProbDeltas[expert] = dot
+			for slot := 0; slot < SlotAttentionSlots; slot++ {
+				row[base+slot] = share * slotDeltas[slot]
+			}
 		}
 
+		var gateProbDeltas [SlotAttentionExperts]float64
 		if balanceGradScale > 0 {
 			sampleWeight := 1.0
 			if len(sampleWeights) == n && sampleWeights[i] > 0 {

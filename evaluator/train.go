@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pokemon-engine/gamedata"
@@ -33,6 +34,79 @@ type TrainingState struct {
 	PatienceCounter int     `json:"patienceCounter"`
 	MainAdamStep    int64   `json:"mainAdamStep"`
 	AttnAdamStep    int64   `json:"attnAdamStep"`
+}
+
+var globalGameCounter uint64
+
+type GamePhaseStats struct {
+	Correct [3]int
+	Total   [3]int
+}
+
+type GameStatsTracker struct {
+	mu          sync.Mutex
+	last1000    []uint64
+	gameMap     map[uint64]*GamePhaseStats
+	historySize int
+}
+
+func NewGameStatsTracker(size int) *GameStatsTracker {
+	return &GameStatsTracker{
+		gameMap:     make(map[uint64]*GamePhaseStats),
+		historySize: size,
+	}
+}
+
+func (t *GameStatsTracker) Record(gameID uint64, turnPct float64, correct bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	stats, exists := t.gameMap[gameID]
+	if !exists {
+		stats = &GamePhaseStats{}
+		t.gameMap[gameID] = stats
+		t.last1000 = append(t.last1000, gameID)
+		if len(t.last1000) > t.historySize {
+			oldID := t.last1000[0]
+			t.last1000 = t.last1000[1:]
+			delete(t.gameMap, oldID)
+		}
+	}
+
+	phase := 0
+	if turnPct >= 0.66 {
+		phase = 2
+	} else if turnPct >= 0.33 {
+		phase = 1
+	}
+
+	stats.Total[phase]++
+	if correct {
+		stats.Correct[phase]++
+	}
+}
+
+func (t *GameStatsTracker) GetPhaseAccuracy() [3]float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var totals [3]int
+	var corrects [3]int
+	for _, id := range t.last1000 {
+		s := t.gameMap[id]
+		for i := 0; i < 3; i++ {
+			totals[i] += s.Total[i]
+			corrects[i] += s.Correct[i]
+		}
+	}
+
+	var acc [3]float64
+	for i := 0; i < 3; i++ {
+		if totals[i] > 0 {
+			acc[i] = float64(corrects[i]) / float64(totals[i])
+		}
+	}
+	return acc
 }
 
 func SaveTrainingState(path string, state TrainingState) {
@@ -161,7 +235,7 @@ func tuneKernelBatchSize(mlp *MLP, attentionMLP *MLP) int {
 				slotWeightsBatch[i] = row
 			}
 
-			_ = mlp.CalculateBCELocalGradientsBatch(mainInputs[:batch], mainTargets[:batch], sampleWeights[:batch])
+			_, _ = mlp.CalculateBCELocalGradientsBatch(mainInputs[:batch], mainTargets[:batch], sampleWeights[:batch])
 			slotDeltaFlat := mlp.AttentionOutputDeltasFromFirstLayerBatch(
 				TotalGlobals,
 				attnInputs[:batch],
@@ -209,12 +283,15 @@ func tuneKernelBatchSize(mlp *MLP, attentionMLP *MLP) int {
 }
 
 type preparedSnapshot struct {
-	prefix      []float64
-	rawSlots    []float64
-	targets     []float64
-	eloWeight   float64
-	isSearchTag bool
-	turn        int
+	prefix       []float64
+	rawSlots     []float64
+	targets      []float64
+	validActions []int
+	eloWeight    float64
+	isSearchTag  bool
+	turn         int
+	GameID       uint64
+	TurnPercent  float64
 }
 
 type gpuEpochStats struct {
@@ -222,6 +299,7 @@ type gpuEpochStats struct {
 	totalBCELoss   float64
 	totalBalance   float64
 	validSnapshots int
+	PhaseAccuracy  [3]float64
 }
 
 type replayLabelStats struct {
@@ -322,7 +400,7 @@ func isActionValidForState(state *simulator.BattleState, action int) bool {
 	return false
 }
 
-func buildPreparedSnapshot(state *simulator.BattleState, chosenAction int, matchWinner float64, eloWeight float64) (preparedSnapshot, string, bool) {
+func buildPreparedSnapshot(state *simulator.BattleState, chosenAction int, matchWinner float64, eloWeight float64, turn int, totalTurns int, gameID uint64) (preparedSnapshot, string, bool) {
 	if chosenAction < 0 || chosenAction >= simulator.MaxActions {
 		return preparedSnapshot{}, "mapped_action_out_of_range", false
 	}
@@ -338,6 +416,10 @@ func buildPreparedSnapshot(state *simulator.BattleState, chosenAction int, match
 		targets[i] = -1.0
 	}
 	targets[chosenAction] = matchWinner
+
+	va, nVa := simulator.GetSearchActions(&state.P1)
+	validActions := make([]int, nVa)
+	copy(validActions, va[:nVa])
 
 	rawSlots := make([]float64, 0, TotalSlotFeatures)
 	rawSlots = append(rawSlots, p1Slots[:]...)
@@ -360,11 +442,20 @@ func buildPreparedSnapshot(state *simulator.BattleState, chosenAction int, match
 	vectorizeBoosts(state.P2.GetActive(), &prefixArr, &idx)
 	vectorizeMatchup(state, &prefixArr, &idx)
 
+	turnPct := 0.0
+	if totalTurns > 0 {
+		turnPct = float64(turn) / float64(totalTurns)
+	}
+
 	return preparedSnapshot{
-		prefix:    append([]float64(nil), prefixArr[:TotalGlobals]...),
-		rawSlots:  rawSlots,
-		targets:   targets,
-		eloWeight: eloWeight,
+		prefix:       append([]float64(nil), prefixArr[:TotalGlobals]...),
+		rawSlots:     rawSlots,
+		targets:      targets,
+		validActions: validActions,
+		eloWeight:    eloWeight,
+		turn:         turn,
+		GameID:       gameID,
+		TurnPercent:  turnPct,
 	}, "", true
 }
 
@@ -413,7 +504,7 @@ func actionLabelForIndex(action int) string {
 	return fmt.Sprintf("action%d", action)
 }
 
-func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, eloWeight float64) ([]preparedSnapshot, replayLabelStats) {
+func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, eloWeight float64, gameID uint64) ([]preparedSnapshot, replayLabelStats) {
 	stats := newReplayLabelStats()
 	samples := make([]preparedSnapshot, 0, len(replay.Events)/2)
 
@@ -435,7 +526,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.skip(reason)
 				continue
 			}
-			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight)
+			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight, event.Turn, replay.Turns, gameID)
 			if !ok {
 				stats.skip(reason)
 				continue
@@ -465,7 +556,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.moveSlotFallbacks++
 			}
 			action := simulator.ActionMove1 + slot
-			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight)
+			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight, event.Turn, replay.Turns, gameID)
 			if !ok {
 				stats.skip(reason)
 				continue
@@ -495,7 +586,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.moveSlotFallbacks++
 			}
 			action := simulator.ActionTeraMove1 + slot
-			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight)
+			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight, event.Turn, replay.Turns, gameID)
 			if !ok {
 				stats.skip(reason)
 				continue
@@ -511,6 +602,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 
 func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learningRate float64, samples <-chan preparedSnapshot, progressCh chan<- gpuEpochStats) gpuEpochStats {
 	stats := gpuEpochStats{}
+	tracker := NewGameStatsTracker(1000)
 	workerBatchCount := 0
 	batch := make([]preparedSnapshot, 0, kernelBatchSize)
 	defaultWeights := uniformSlotWeights()
@@ -557,8 +649,28 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 			mainInputsBatch[sampleIdx] = mainInputs
 		}
 
-		bceLoss := mlp.CalculateBCELocalGradientsBatch(mainInputsBatch, targetsBatch, eloWeightsBatch)
+		bceLoss, outputsBatch := mlp.CalculateBCELocalGradientsBatch(mainInputsBatch, targetsBatch, eloWeightsBatch)
 		stats.validSnapshots += n
+
+		for i := 0; i < n; i++ {
+			output := outputsBatch[i]
+			target := targetsBatch[i]
+			chosenAction := -1
+			for j := 0; j < len(target); j++ {
+				if target[j] >= 0 {
+					chosenAction = j
+					break
+				}
+			}
+			if chosenAction == -1 {
+				continue
+			}
+
+			targetWin := target[chosenAction] >= 0.5
+			predictedWin := output[chosenAction] >= 0.5
+			tracker.Record(batch[i].GameID, batch[i].TurnPercent, predictedWin == targetWin)
+		}
+		stats.PhaseAccuracy = tracker.GetPhaseAccuracy()
 
 		attentionDeltaFlat := mlp.AttentionOutputDeltasFromFirstLayerBatch(
 			TotalGlobals,
@@ -712,8 +824,8 @@ func TrainNetwork(replaysDir string, epochs int) error {
 				}
 				elapsed := time.Since(epochStart)
 				rate := float64(s.validSnapshots) / elapsed.Seconds()
-				fmt.Printf("\r  -> Progress: %d snapshots | Avg Loss: %.6f | Speed: %.0f/s        ",
-					s.validSnapshots, avgLoss, rate)
+				fmt.Printf("\r  -> Progress: %d snapshots | Loss: %.6f | W/L: E:%.1f%% M:%.1f%% L:%.1f%% | Speed: %.0f/s        ",
+					s.validSnapshots, avgLoss, s.PhaseAccuracy[0]*100, s.PhaseAccuracy[1]*100, s.PhaseAccuracy[2]*100, rate)
 				lastReport = time.Now()
 			}
 		}()
@@ -758,7 +870,8 @@ func TrainNetwork(replaysDir string, epochs int) error {
 							matchWinner = 0.0
 						}
 
-						replaySamples, replayStats := buildReplayChosenActionSamples(replay, matchWinner, eloWeight)
+						gameID := atomic.AddUint64(&globalGameCounter, 1)
+						replaySamples, replayStats := buildReplayChosenActionSamples(replay, matchWinner, eloWeight, gameID)
 						localStats.merge(replayStats)
 						for _, sample := range replaySamples {
 							samples <- sample
