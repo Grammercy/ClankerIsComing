@@ -35,6 +35,18 @@ const (
 	DefaultLatentPredictionToken = 0.0
 )
 
+const (
+	// Main evaluator outputs action logits plus next-step latent token predictions.
+	MainActionOutputSize = simulator.MaxActions
+	MainOutputSize       = MainActionOutputSize + LatentTokenFeatures
+)
+
+const (
+	ReasoningTokenOutputIndex  = MainActionOutputSize
+	PredictionTokenOutputIndex = MainActionOutputSize + 1
+	LatentRecurrenceSteps      = 5
+)
+
 // TotalGlobals = 6 player globals + 12 field + 20 side (10*2) + 10 boosts (5*2) + 2 matchup + 2 latent tokens
 const TotalGlobals = 6 + FieldFeatures + 2*SideFeatures + BoostFeatures + MatchupFeatures + LatentTokenFeatures // 52
 
@@ -111,8 +123,17 @@ func EvaluateAllWithLatentTokens(state *simulator.BattleState, mlpCache *Inferen
 
 	if GlobalMLP != nil {
 		var features [TotalFeatures]float64
-		VectorizeWithLatentTokens(state, GlobalAttentionMLP, &features, attentionCache, latentReasoningToken, latentPredictionToken)
-		output := GlobalMLP.Forward(features[:], mlpCache)
+		output := make([]float64, 0, MainOutputSize)
+		reasoningToken := latentReasoningToken
+		predictionToken := latentPredictionToken
+		for step := 0; step < LatentRecurrenceSteps; step++ {
+			VectorizeWithLatentTokens(state, GlobalAttentionMLP, &features, attentionCache, reasoningToken, predictionToken)
+			output = GlobalMLP.Forward(features[:], mlpCache)
+			if len(output) > PredictionTokenOutputIndex {
+				reasoningToken = output[ReasoningTokenOutputIndex]
+				predictionToken = output[PredictionTokenOutputIndex]
+			}
+		}
 
 		for i := 0; i < simulator.MaxActions; i++ {
 			if i < len(output) {
@@ -129,7 +150,7 @@ func EvaluateAllWithLatentTokens(state *simulator.BattleState, mlpCache *Inferen
 	return result
 }
 
-// AttentionWeights returns the MoE-composed softmax-normalized 12-slot attention weights
+// AttentionWeights returns softmax-normalized 12-slot attention weights
 // (P1 slots 0-5 followed by P2 slots 0-5) used during vectorization.
 // The bool return is false when the attention network is unavailable.
 func AttentionWeights(state *simulator.BattleState, cache *InferenceCache) ([12]float64, bool) {
@@ -150,12 +171,12 @@ func AttentionWeights(state *simulator.BattleState, cache *InferenceCache) ([12]
 	rawSlots = append(rawSlots, p2Slots[:]...)
 
 	rawAttention := GlobalAttentionMLP.Forward(rawSlots, cache)
-	moeWeights, ok := attentionWeightsFromMoEOutput(rawAttention)
+	attnWeights, ok := attentionWeightsFromOutput(rawAttention)
 	if !ok {
 		return weights, false
 	}
 	for i := 0; i < len(weights); i++ {
-		weights[i] = moeWeights[i]
+		weights[i] = attnWeights[i]
 	}
 	return weights, true
 }
@@ -179,7 +200,17 @@ func EvaluateWithLatentTokens(state *simulator.BattleState, action int, mlp *MLP
 			}
 		}
 
-		output := mlp.Forward(features[:], mlpCache)
+		output := make([]float64, 0, MainOutputSize)
+		reasoningToken := latentReasoningToken
+		predictionToken := latentPredictionToken
+		for step := 0; step < LatentRecurrenceSteps; step++ {
+			VectorizeWithLatentTokens(state, attentionMLP, &features, attentionCache, reasoningToken, predictionToken)
+			output = mlp.Forward(features[:], mlpCache)
+			if len(output) > PredictionTokenOutputIndex {
+				reasoningToken = output[ReasoningTokenOutputIndex]
+				predictionToken = output[PredictionTokenOutputIndex]
+			}
+		}
 		if action >= 0 && action < len(output) {
 			return output[action]
 		}
@@ -239,97 +270,8 @@ func EvaluateBatchStatesWithLatentTokens(states []simulator.BattleState, latentR
 		return results
 	}
 
-	mainInputs := make([][]float64, len(states))
-	rawSlotsBatch := make([][]float64, len(states))
-	validActionsBatch := make([][simulator.MaxActions]int, len(states))
-	validLens := make([]int, len(states))
-
 	for i := range states {
-		state := &states[i]
-		p1Globals, p1Slots := vectorizePlayerFeatures(&state.P1, state)
-		p2Globals, p2Slots := vectorizePlayerFeatures(&state.P2, state)
-
-		mainInputs[i] = make([]float64, TotalFeatures)
-		rawSlots := make([]float64, 0, TotalSlotFeatures)
-		rawSlots = append(rawSlots, p1Slots[:]...)
-		rawSlots = append(rawSlots, p2Slots[:]...)
-		rawSlotsBatch[i] = rawSlots
-
-		idx := 0
-		mainInputs[i][idx] = p1Globals[0]
-		idx++
-		mainInputs[i][idx] = p1Globals[1]
-		idx++
-		mainInputs[i][idx] = p2Globals[0]
-		idx++
-		mainInputs[i][idx] = p2Globals[1]
-		idx++
-		mainInputs[i][idx] = p1Globals[2]
-		idx++
-		mainInputs[i][idx] = p2Globals[2]
-		idx++
-		var tmp [TotalFeatures]float64
-		copy(tmp[:TotalGlobals], mainInputs[i][:TotalGlobals])
-		tmpIdx := idx
-		vectorizeFieldConditions(&state.Field, &tmp, &tmpIdx)
-		vectorizeSideConditions(&state.P1.Side, &tmp, &tmpIdx)
-		vectorizeSideConditions(&state.P2.Side, &tmp, &tmpIdx)
-		vectorizeBoosts(state.P1.GetActive(), &tmp, &tmpIdx)
-		vectorizeBoosts(state.P2.GetActive(), &tmp, &tmpIdx)
-		vectorizeMatchup(state, &tmp, &tmpIdx)
-		vectorizeLatentTokens(&tmp, &tmpIdx, latentReasoningToken, latentPredictionToken)
-		copy(mainInputs[i][:TotalGlobals], tmp[:TotalGlobals])
-
-		validActions, validLen := simulator.GetSearchActions(&state.P1)
-		validActionsBatch[i] = validActions
-		validLens[i] = validLen
-	}
-
-	if GlobalAttentionMLP != nil {
-		rawMoEBatch := GlobalAttentionMLP.ForwardBatch(rawSlotsBatch)
-		defaultWeights := uniformSlotWeights()
-		for sampleIdx, rawMoE := range rawMoEBatch {
-			slotWeights, ok := attentionWeightsFromMoEOutput(rawMoE)
-			if !ok {
-				slotWeights = defaultWeights
-			}
-
-			dst := mainInputs[sampleIdx][TotalGlobals:]
-			src := rawSlotsBatch[sampleIdx]
-			for slotIdx := 0; slotIdx < SlotAttentionSlots; slotIdx++ {
-				w := slotWeights[slotIdx]
-				base := slotIdx * FeaturesPerSlot
-				for j := 0; j < FeaturesPerSlot; j++ {
-					dst[base+j] = src[base+j] * w
-				}
-			}
-		}
-	} else {
-		for i := range states {
-			copy(mainInputs[i][TotalGlobals:], rawSlotsBatch[i])
-		}
-	}
-
-	outputs := GlobalMLP.ForwardBatch(mainInputs)
-	for i := range outputs {
-		validLen := validLens[i]
-		if validLen == 0 {
-			results[i] = 0.5
-			continue
-		}
-
-		maxQ := -math.MaxFloat64
-		for j := 0; j < validLen; j++ {
-			action := validActionsBatch[i][j]
-			if action >= 0 && action < len(outputs[i]) && outputs[i][action] > maxQ {
-				maxQ = outputs[i][action]
-			}
-		}
-		if maxQ == -math.MaxFloat64 {
-			results[i] = 0.5
-		} else {
-			results[i] = maxQ
-		}
+		results[i] = EvaluateWithLatentTokens(&states[i], -1, GlobalMLP, GlobalAttentionMLP, nil, nil, nil, latentReasoningToken, latentPredictionToken)
 	}
 
 	return results
@@ -391,10 +333,10 @@ func VectorizeWithLatentTokens(state *simulator.BattleState, attention *MLP, out
 		idx++
 	}
 
-	// Apply MoE slot routing if network is provided
+	// Apply learned slot attention if network is provided
 	if attention != nil {
-		rawMoE := attention.Forward(out[slotsStartIdx:idx], cache)
-		attentionWeights, ok := attentionWeightsFromMoEOutput(rawMoE)
+		rawAttention := attention.Forward(out[slotsStartIdx:idx], cache)
+		attentionWeights, ok := attentionWeightsFromOutput(rawAttention)
 		if !ok {
 			attentionWeights = uniformSlotWeights()
 		}

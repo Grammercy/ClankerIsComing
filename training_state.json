@@ -1,0 +1,8 @@
+{
+  "epoch": 5,
+  "learningRate": 0.001,
+  "bestMSE": 1.1806110355236692,
+  "patienceCounter": 0,
+  "mainAdamStep": 80,
+  "attnAdamStep": 80
+}

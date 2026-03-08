@@ -39,10 +39,12 @@ func OnlineLearn(experiences []ExperienceTuple, reward float64) {
 
 		// Build targets: keep current predictions for all actions (zero gradient),
 		// except for the chosen action which we push toward the reward
-		targets := make([]float64, simulator.MaxActions)
+		targets := make([]float64, MainOutputSize)
 		for i := 0; i < simulator.MaxActions; i++ {
 			targets[i] = currentPredictions[i]
 		}
+		targets[ReasoningTokenOutputIndex] = -1.0
+		targets[PredictionTokenOutputIndex] = -1.0
 
 		// Only train the action that was actually taken
 		if exp.Action >= 0 && exp.Action < simulator.MaxActions {
