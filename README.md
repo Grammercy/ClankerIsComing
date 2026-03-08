@@ -114,8 +114,12 @@ Connects to Showdown and begins accepting random battle challenges.
 
 ### Offline Utility Commands
 * **`scrape`**: Download replays from Pokemon Showdown. ` -format gen9randombattle -num 100`
+* **`import`**: Download a single replay from a URL. ` -url https://replay.pokemonshowdown.com/gen9randombattle-12345`
 * **`parse`**: Extract structured data from raw log files.
+* **`actions`**: Generate legally available actions at a specific turn from a replay.
+* **`verify-actions`**: Verify legal actions generated for parsed replays against recorded ones.
 * **`evaluate`**: Predict win probability at a specific turn from a replay.
+* **`bulk-evaluate`**: Bulk evaluate replays in a directory.
 * **`search-evaluate`**: Run deep MCTS search on a replay turn.
 
 ### Training & Self-Play
@@ -132,6 +136,7 @@ go run . -cmd train-tagged -tagged data/tagged -epochs 10
 ```
 
 Additional Commands:
+* `train`: Train the network directly on raw replay logs without tagging.
 * `selfplay`: Generate synthetic matches via AI vs AI games.
 * `mixed-train`: Train the network using a mix of fast depth-0 targets and hard search targets.
 
