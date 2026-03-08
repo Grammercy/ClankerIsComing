@@ -33,6 +33,7 @@ OPENCL_LDFLAGS += -lOpenCL
 help:
 	@echo "Targets:"
 	@echo "  make windows-opencl   Build Windows binary with OpenCL support (GOOS=windows, -tags opencl)"
+	@echo "  make windows-rocm     Build Windows binary with ROCm support (GOOS=windows, -tags rocm)"
 	@echo ""
 	@echo "Config vars:"
 	@echo "  CROSS_CC, CROSS_CXX   Cross compilers (default: x86_64-w64-mingw32-gcc/g++)"
@@ -55,3 +56,15 @@ windows-opencl: check-cross-toolchain
 	CGO_CFLAGS="$(OPENCL_CFLAGS)" \
 	CGO_LDFLAGS="$(OPENCL_LDFLAGS)" \
 	go build -tags opencl -o $(APP) $(PKG)
+
+windows-rocm: check-cross-toolchain
+	@echo "Building $(APP) for Windows with ROCm..."
+	CGO_ENABLED=1 \
+	GOOS=windows \
+	GOARCH=amd64 \
+	CC=$(CROSS_CC) \
+	CXX=$(CROSS_CXX) \
+	CGO_CFLAGS="$(OPENCL_CFLAGS)" \
+	CGO_LDFLAGS="$(OPENCL_LDFLAGS)" \
+	go build -tags rocm -o $(APP) $(PKG)
+

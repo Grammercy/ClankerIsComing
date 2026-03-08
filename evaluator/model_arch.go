@@ -1,10 +1,8 @@
 package evaluator
 
-import "github.com/pokemon-engine/simulator"
-
 func mainMLPLayerSizes() []int {
-	// 675,626 params in main MLP for much faster training/inference.
-	return []int{TotalFeatures, 512, 256, 96, simulator.MaxActions}
+	// Main head outputs actions plus 2 recurrent latent token channels.
+	return []int{TotalFeatures, 1700, 1760, 1130, MainOutputSize}
 }
 
 func mlpParamCount(sizes []int) int {

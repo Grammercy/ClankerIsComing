@@ -46,7 +46,7 @@ func buildInputFromPrepared(sample preparedSnapshot, attentionMLP *MLP) []float6
 	mainInputs := make([]float64, TotalFeatures)
 	copy(mainInputs, sample.prefix)
 
-	slotWeights, ok := attentionWeightsFromMoEOutput(attentionMLP.Forward(sample.rawSlots, nil))
+	slotWeights, ok := attentionWeightsFromOutput(attentionMLP.Forward(sample.rawSlots, nil))
 	if !ok {
 		slotWeights = uniformSlotWeights()
 	}
@@ -130,7 +130,7 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 	mainSizes := mainMLPLayerSizes()
 	attnSizes := attentionMLPLayerSizes()
 	fmt.Printf("Initializing Main MLP %v (%d params)...\n", mainSizes, mlpParamCount(mainSizes))
-	fmt.Printf("Model total (main + MoE router): %d params\n", totalEvaluatorParamCount())
+	fmt.Printf("Model total (main + attention): %d params\n", totalEvaluatorParamCount())
 	mlp := NewMLP(mainSizes)
 	if err := mlp.LoadWeights("evaluator_weights.json"); err == nil {
 		if mlp.HasLayerSizes(mainSizes) {
@@ -143,19 +143,19 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		fmt.Println("Starting Main MLP from scratch...")
 	}
 
-	fmt.Printf("Initializing MoE Router MLP %v (%d params, %d experts)...\n", attnSizes, mlpParamCount(attnSizes), SlotAttentionExperts)
+	fmt.Printf("Initializing Attention MLP %v (%d params)...\n", attnSizes, mlpParamCount(attnSizes))
 	attentionMLP := NewMLP(attnSizes)
 	attentionMLP.LinearOutput = true
 	if err := attentionMLP.LoadWeights("attention_weights.json"); err == nil {
 		if attentionMLP.HasLayerSizes(attnSizes) {
 			fmt.Println("Loaded existing attention_weights.json...")
 		} else {
-			fmt.Println("Ignoring incompatible attention_weights.json (old architecture); starting MoE router from scratch...")
+			fmt.Println("Ignoring incompatible attention_weights.json (old architecture); starting Attention MLP from scratch...")
 			attentionMLP = NewMLP(attnSizes)
 			attentionMLP.LinearOutput = true
 		}
 	} else {
-		fmt.Println("Starting MoE router from scratch...")
+		fmt.Println("Starting Attention MLP from scratch...")
 	}
 
 	learningRate := 0.05
@@ -179,6 +179,7 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 	const patience = 3
 	const lrDecay = 0.5
 	const minLR = 1e-5
+	const exploratorySamplesPerEpoch int64 = 4000
 	numWorkers := runtime.NumCPU()
 	kernelBatchSize := tuneKernelBatchSize(mlp, attentionMLP)
 	trainingStart := time.Now()
@@ -193,6 +194,27 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		if len(epochEntries) > maxPerEpoch {
 			epochEntries = epochEntries[:maxPerEpoch]
 		}
+		explorationPhase := learningRate > normalScheduleLR
+		explorationBudget := int64(0)
+		if explorationPhase {
+			explorationBudget = exploratorySamplesPerEpoch
+			fmt.Printf("  -> Exploration epoch sample budget: %d\n", explorationBudget)
+		}
+		var samplesQueued int64
+		reserveSample := func() bool {
+			if explorationBudget <= 0 {
+				return true
+			}
+			for {
+				cur := atomic.LoadInt64(&samplesQueued)
+				if cur >= explorationBudget {
+					return false
+				}
+				if atomic.CompareAndSwapInt64(&samplesQueued, cur, cur+1) {
+					return true
+				}
+			}
+		}
 
 		jobs := make(chan os.DirEntry, len(epochEntries))
 		samples := make(chan preparedSnapshot, kernelBatchSize*8)
@@ -202,7 +224,7 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		go func() {
 			lastReport := time.Now()
 			for s := range progressCh {
-				if time.Since(lastReport) < 1*time.Second {
+				if time.Since(lastReport) < 5*time.Second {
 					continue
 				}
 				avgLoss := 0.0
@@ -233,6 +255,9 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 				defer workerWG.Done()
 				local := taggedDataLoadStats{}
 				for entry := range jobs {
+					if explorationBudget > 0 && atomic.LoadInt64(&samplesQueued) >= explorationBudget {
+						break
+					}
 					if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 						continue
 					}
@@ -273,6 +298,9 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 						if maxTurn > 0 {
 							prepared.TurnPercent = float64(tagged.Turn) / float64(maxTurn)
 						}
+						if !reserveSample() {
+							break
+						}
 						samples <- prepared
 						local.samplesLoaded++
 					}
@@ -304,15 +332,13 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 
 		validSnapshots := stats.validSnapshots
 		avgBCE := math.MaxFloat64
-		avgBalance := 0.0
 		avgLoss := math.MaxFloat64
 		if validSnapshots > 0 {
 			avgBCE = stats.totalBCELoss / float64(validSnapshots)
-			avgBalance = stats.totalBalance / float64(validSnapshots)
-			avgLoss = avgBCE + avgBalance
+			avgLoss = avgBCE
 		}
-		fmt.Printf("Epoch %d/%d - Train Loss: %.6f (BCE: %.6f, MoE balance: %.6f, snapshots: %d, LR: %.6f)\n",
-			epoch, epochs, avgLoss, avgBCE, avgBalance, validSnapshots, learningRate)
+		fmt.Printf("Epoch %d/%d - Train Loss: %.6f (BCE: %.6f, snapshots: %d, LR: %.6f)\n",
+			epoch, epochs, avgLoss, avgBCE, validSnapshots, learningRate)
 		epochElapsed := time.Since(epochStart)
 		cumulativeEpochTime += epochElapsed
 		completedEpochs := epoch - startEpoch + 1

@@ -34,7 +34,9 @@ type MLP struct {
 	LinearOutput bool
 	AdamStep     int64
 
-	gpu *openclMLPBackend
+	gpu       *openclMLPBackend
+	gpuLayers []*openclLayerBuffers
+	active    interface{} // Current active inference backend
 }
 
 func (mlp *MLP) HasLayerSizes(sizes []int) bool {
@@ -89,11 +91,15 @@ func NewMLP(sizes []int) *MLP {
 		mlp.Layers[i] = layer
 	}
 
-	backend, err := newOpenCLMLPBackend(mlp)
+	backend, err := newOpenCLMLPBackend()
 	if err != nil {
-		fmt.Printf("Warning: failed to initialize OpenCL MLP backend (falling back to CPU): %v\n", err)
+		fmt.Printf("Warning: failed to initialize OpenCL/ROCm MLP backend (falling back to CPU): %v\n", err)
 	} else {
-		mlp.gpu = backend
+		if err := backend.InitMLP(mlp); err != nil {
+			fmt.Printf("Warning: failed to initialize MLP GPU layers: %v\n", err)
+		} else {
+			mlp.gpu = backend
+		}
 	}
 
 	return mlp
@@ -141,13 +147,14 @@ type WorkerCache struct {
 	BiasGradients   [][]float64
 }
 
-
 func (mlp *MLP) ensureGPU() {
-	// Re-initialization attempt if nil, but don't panic
 	if mlp.gpu == nil {
-		backend, err := newOpenCLMLPBackend(mlp)
+		backend, err := newOpenCLMLPBackend()
 		if err != nil {
-			// Log once and don't try again if it's a permanent failure (stub)
+			return
+		}
+		if err := backend.InitMLP(mlp); err != nil {
+			fmt.Printf("Warning: failed to initialize MLP GPU layers: %v\n", err)
 			return
 		}
 		mlp.gpu = backend
@@ -258,7 +265,7 @@ func (mlp *MLP) ApplyAdamGradients(cache *WorkerCache, batchSize float64, lr, we
 
 func (mlp *MLP) ClearGradients() {
 	mlp.ensureGPU()
-	if err := mlp.gpu.clearGradients(); err != nil {
+	if err := mlp.gpu.clearGradients(mlp); err != nil {
 		panic(fmt.Sprintf("OpenCL clear gradients failed: %v", err))
 	}
 }

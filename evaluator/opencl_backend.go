@@ -1,4 +1,4 @@
-//go:build opencl
+//go:build opencl && !rocm
 
 package evaluator
 
@@ -568,661 +568,6 @@ func (b *openclMLPBackend) enqueueKernel1D(kernel *cl.Kernel, logicalSize int) e
 	return err
 }
 
-func newOpenCLMLPBackend(mlp *MLP) (*openclMLPBackend, error) {
-	dev, err := pickBestGPU()
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, err := cl.CreateContext([]*cl.Device{dev})
-	if err != nil {
-		return nil, fmt.Errorf("create OpenCL context: %w", err)
-	}
-
-	queue, err := ctx.CreateCommandQueue(dev, 0)
-	if err != nil {
-		ctx.Release()
-		return nil, fmt.Errorf("create OpenCL command queue: %w", err)
-	}
-
-	program, err := ctx.CreateProgramWithSource([]string{mlpOpenCLSource})
-	if err != nil {
-		queue.Release()
-		ctx.Release()
-		return nil, fmt.Errorf("create OpenCL program: %w", err)
-	}
-	if err := program.BuildProgram(nil, ""); err != nil {
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, fmt.Errorf("build OpenCL program: %w", err)
-	}
-
-	mk := func(name string) (*cl.Kernel, error) {
-		k, kErr := program.CreateKernel(name)
-		if kErr != nil {
-			return nil, fmt.Errorf("create kernel %q: %w", name, kErr)
-		}
-		return k, nil
-	}
-
-	denseForwardKernel, err := mk("dense_forward")
-	if err != nil {
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	outputDeltaBCEKernel, err := mk("output_delta_bce")
-	if err != nil {
-		denseForwardKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	setOutputDeltasKernel, err := mk("set_output_deltas")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	hiddenDeltaKernel, err := mk("hidden_delta")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	accWeightGradsKernel, err := mk("accumulate_weight_grads")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	accBiasGradsKernel, err := mk("accumulate_bias_grads")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	adamUpdateKernel, err := mk("adam_update")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	firstInputGradsKernel, err := mk("first_layer_input_grads")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	denseForwardBatchKernel, err := mk("dense_forward_batch")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	outputDeltaBCEBatchKernel, err := mk("output_delta_bce_batch")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		denseForwardBatchKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	setOutputDeltasBatchKernel, err := mk("set_output_deltas_batch")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		denseForwardBatchKernel.Release()
-		outputDeltaBCEBatchKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	hiddenDeltaBatchKernel, err := mk("hidden_delta_batch")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		denseForwardBatchKernel.Release()
-		outputDeltaBCEBatchKernel.Release()
-		setOutputDeltasBatchKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	accWeightGradsBatchKernel, err := mk("accumulate_weight_grads_batch")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		denseForwardBatchKernel.Release()
-		outputDeltaBCEBatchKernel.Release()
-		setOutputDeltasBatchKernel.Release()
-		hiddenDeltaBatchKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	accBiasGradsBatchKernel, err := mk("accumulate_bias_grads_batch")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		denseForwardBatchKernel.Release()
-		outputDeltaBCEBatchKernel.Release()
-		setOutputDeltasBatchKernel.Release()
-		hiddenDeltaBatchKernel.Release()
-		accWeightGradsBatchKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	firstInputGradsBatchKernel, err := mk("first_layer_input_grads_batch")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		denseForwardBatchKernel.Release()
-		outputDeltaBCEBatchKernel.Release()
-		setOutputDeltasBatchKernel.Release()
-		hiddenDeltaBatchKernel.Release()
-		accWeightGradsBatchKernel.Release()
-		accBiasGradsBatchKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	attentionDeltaInputKernel, err := mk("attention_output_deltas_from_input_grads")
-	if err != nil {
-		denseForwardKernel.Release()
-		outputDeltaBCEKernel.Release()
-		setOutputDeltasKernel.Release()
-		hiddenDeltaKernel.Release()
-		accWeightGradsKernel.Release()
-		accBiasGradsKernel.Release()
-		adamUpdateKernel.Release()
-		firstInputGradsKernel.Release()
-		denseForwardBatchKernel.Release()
-		outputDeltaBCEBatchKernel.Release()
-		setOutputDeltasBatchKernel.Release()
-		hiddenDeltaBatchKernel.Release()
-		accWeightGradsBatchKernel.Release()
-		accBiasGradsBatchKernel.Release()
-		firstInputGradsBatchKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-
-	backend := &openclMLPBackend{
-		ctx:                        ctx,
-		queue:                      queue,
-		device:                     dev,
-		program:                    program,
-		denseForwardKernel:         denseForwardKernel,
-		outputDeltaBCEKernel:       outputDeltaBCEKernel,
-		setOutputDeltasKernel:      setOutputDeltasKernel,
-		hiddenDeltaKernel:          hiddenDeltaKernel,
-		denseForwardBatchKernel:    denseForwardBatchKernel,
-		outputDeltaBCEBatchKernel:  outputDeltaBCEBatchKernel,
-		setOutputDeltasBatchKernel: setOutputDeltasBatchKernel,
-		hiddenDeltaBatchKernel:     hiddenDeltaBatchKernel,
-		accWeightGradsBatchKernel:  accWeightGradsBatchKernel,
-		accBiasGradsBatchKernel:    accBiasGradsBatchKernel,
-		accWeightGradsKernel:       accWeightGradsKernel,
-		accBiasGradsKernel:         accBiasGradsKernel,
-		adamUpdateKernel:           adamUpdateKernel,
-		firstInputGradsKernel:      firstInputGradsKernel,
-		firstInputGradsBatchKernel: firstInputGradsBatchKernel,
-		attentionDeltaInputKernel:  attentionDeltaInputKernel,
-		layers:                     make([]*openclLayerBuffers, len(mlp.Layers)),
-		kernelLocal1D:              make(map[*cl.Kernel]int, 17),
-	}
-
-	for _, kernel := range []*cl.Kernel{
-		denseForwardKernel,
-		outputDeltaBCEKernel,
-		setOutputDeltasKernel,
-		hiddenDeltaKernel,
-		denseForwardBatchKernel,
-		outputDeltaBCEBatchKernel,
-		setOutputDeltasBatchKernel,
-		hiddenDeltaBatchKernel,
-		accWeightGradsBatchKernel,
-		accBiasGradsBatchKernel,
-		accWeightGradsKernel,
-		accBiasGradsKernel,
-		adamUpdateKernel,
-		firstInputGradsKernel,
-		firstInputGradsBatchKernel,
-		attentionDeltaInputKernel,
-	} {
-		backend.kernelLocal1D[kernel] = chooseKernelLocalSize(dev, kernel)
-	}
-
-	createRWBufferWithData := func(data []float32) (*cl.MemObject, error) {
-		buf, e := ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(data))
-		if e != nil {
-			return nil, e
-		}
-		if len(data) > 0 {
-			if _, e = queue.EnqueueWriteBufferFloat32(buf, false, 0, data, nil); e != nil {
-				buf.Release()
-				return nil, e
-			}
-		}
-		return buf, nil
-	}
-
-	maxBatch := 1024
-	if env := strings.TrimSpace(os.Getenv("OPENCL_MAX_BATCH")); env != "" {
-		if v, convErr := strconv.Atoi(env); convErr == nil && v > 0 {
-			maxBatch = v
-		}
-	}
-	backend.maxBatchSize = maxBatch
-
-	maxWidth := 0
-	for i, layer := range mlp.Layers {
-		inSize := len(layer.Weights[0])
-		outSize := len(layer.Weights)
-		if inSize > maxWidth {
-			maxWidth = inSize
-		}
-		if outSize > maxWidth {
-			maxWidth = outSize
-		}
-
-		weights := flatten2DF64(layer.Weights)
-		biases := float64To32(layer.Biases)
-		bnMean := float64To32(layer.BNRunningMean)
-		bnVar := float64To32(layer.BNRunningVar)
-		weightM := make([]float32, len(weights))
-		weightV := make([]float32, len(weights))
-		biasM := make([]float32, len(biases))
-		biasV := make([]float32, len(biases))
-
-		wBuf, e := createRWBufferWithData(weights)
-		if e != nil {
-			backend.Release()
-			return nil, fmt.Errorf("create weights buffer layer %d: %w", i, e)
-		}
-		bBuf, e := createRWBufferWithData(biases)
-		if e != nil {
-			wBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create bias buffer layer %d: %w", i, e)
-		}
-		bnMeanBuf, e := createRWBufferWithData(bnMean)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create bn-mean buffer layer %d: %w", i, e)
-		}
-		bnVarBuf, e := createRWBufferWithData(bnVar)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create bn-var buffer layer %d: %w", i, e)
-		}
-		bnBatchMeanBuf, e := createRWBufferWithData(make([]float32, outSize))
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create bn-batch-mean buffer layer %d: %w", i, e)
-		}
-		bnBatchVarInit := make([]float32, outSize)
-		for j := range bnBatchVarInit {
-			bnBatchVarInit[j] = 1
-		}
-		bnBatchVarBuf, e := createRWBufferWithData(bnBatchVarInit)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create bn-batch-var buffer layer %d: %w", i, e)
-		}
-		wmBuf, e := createRWBufferWithData(weightM)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create weight m buffer layer %d: %w", i, e)
-		}
-		wvBuf, e := createRWBufferWithData(weightV)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create weight v buffer layer %d: %w", i, e)
-		}
-		bmBuf, e := createRWBufferWithData(biasM)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create bias m buffer layer %d: %w", i, e)
-		}
-		bvBuf, e := createRWBufferWithData(biasV)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			bmBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create bias v buffer layer %d: %w", i, e)
-		}
-		outBuf, e := ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			bmBuf.Release()
-			bvBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create output buffer layer %d: %w", i, e)
-		}
-		deltaBuf, e := ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			bmBuf.Release()
-			bvBuf.Release()
-			outBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create delta buffer layer %d: %w", i, e)
-		}
-		batchOutBuf, e := ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize*maxBatch)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			bmBuf.Release()
-			bvBuf.Release()
-			outBuf.Release()
-			deltaBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create batch output buffer layer %d: %w", i, e)
-		}
-		batchDelBuf, e := ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize*maxBatch)
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			bmBuf.Release()
-			bvBuf.Release()
-			outBuf.Release()
-			deltaBuf.Release()
-			batchOutBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create batch delta buffer layer %d: %w", i, e)
-		}
-		gradW, e := createRWBufferWithData(make([]float32, len(weights)))
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			bmBuf.Release()
-			bvBuf.Release()
-			outBuf.Release()
-			deltaBuf.Release()
-			batchOutBuf.Release()
-			batchDelBuf.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create gradW buffer layer %d: %w", i, e)
-		}
-		gradB, e := createRWBufferWithData(make([]float32, len(biases)))
-		if e != nil {
-			wBuf.Release()
-			bBuf.Release()
-			bnMeanBuf.Release()
-			bnVarBuf.Release()
-			bnBatchMeanBuf.Release()
-			bnBatchVarBuf.Release()
-			wmBuf.Release()
-			wvBuf.Release()
-			bmBuf.Release()
-			bvBuf.Release()
-			outBuf.Release()
-			deltaBuf.Release()
-			batchOutBuf.Release()
-			batchDelBuf.Release()
-			gradW.Release()
-			backend.Release()
-			return nil, fmt.Errorf("create gradB buffer layer %d: %w", i, e)
-		}
-
-		backend.layers[i] = &openclLayerBuffers{
-			inSize:      inSize,
-			outSize:     outSize,
-			weights:     wBuf,
-			biases:      bBuf,
-			bnMean:      bnMeanBuf,
-			bnVar:       bnVarBuf,
-			bnBatchMean: bnBatchMeanBuf,
-			bnBatchVar:  bnBatchVarBuf,
-			weightM:     wmBuf,
-			weightV:     wvBuf,
-			biasM:       bmBuf,
-			biasV:       bvBuf,
-			outputs:     outBuf,
-			deltas:      deltaBuf,
-			batchOut:    batchOutBuf,
-			batchDel:    batchDelBuf,
-			gradWBuf:    gradW,
-			gradBBuf:    gradB,
-		}
-	}
-
-	if maxWidth < 1 {
-		maxWidth = 1
-	}
-	backend.workBufSize = maxWidth
-	backend.bnNeutralMean, err = createRWBufferWithData(make([]float32, maxWidth))
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create neutral BN mean buffer: %w", err)
-	}
-	oneVar := make([]float32, maxWidth)
-	for i := range oneVar {
-		oneVar[i] = 1
-	}
-	backend.bnNeutralVar, err = createRWBufferWithData(oneVar)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create neutral BN var buffer: %w", err)
-	}
-	backend.scratchA, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create scratchA buffer: %w", err)
-	}
-	backend.scratchB, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create scratchB buffer: %w", err)
-	}
-	// Targets/output-delta staging buffers must accommodate the widest output
-	// layer (not a fixed action count), since MoE router output can be larger.
-	backend.targetsBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create targets buffer: %w", err)
-	}
-	backend.inputGradBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create input gradient buffer: %w", err)
-	}
-	backend.batchInputBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth*maxBatch)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create batch input buffer: %w", err)
-	}
-	backend.batchTargetsBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth*maxBatch)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create batch targets buffer: %w", err)
-	}
-	backend.batchScaleBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxBatch)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create batch scale buffer: %w", err)
-	}
-	backend.attentionDeltaBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth*maxBatch)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create attention delta buffer: %w", err)
-	}
-	backend.inputGradBatchBuf, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*maxWidth*maxBatch)
-	if err != nil {
-		backend.Release()
-		return nil, fmt.Errorf("create batch input gradient buffer: %w", err)
-	}
-
-	return backend, nil
-}
-
 func (b *openclMLPBackend) Release() {
 	if b == nil {
 		return
@@ -1377,8 +722,14 @@ func (b *openclMLPBackend) Release() {
 func (b *openclMLPBackend) syncParamsFromHost(mlp *MLP) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if len(b.layers) != len(mlp.Layers) {
+		return fmt.Errorf("OpenCL layer buffer mismatch: backend=%d model=%d", len(b.layers), len(mlp.Layers))
+	}
 
 	for i, layer := range mlp.Layers {
+		if len(layer.Weights) == 0 {
+			return fmt.Errorf("layer %d has no weights", i)
+		}
 		w := flatten2DF64(layer.Weights)
 		bv := float64To32(layer.Biases)
 		bnMean := float64To32(layer.BNRunningMean)
@@ -1402,6 +753,9 @@ func (b *openclMLPBackend) syncParamsFromHost(mlp *MLP) error {
 func (b *openclMLPBackend) syncParamsToHost(mlp *MLP) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if len(b.layers) != len(mlp.Layers) {
+		return fmt.Errorf("OpenCL layer buffer mismatch: backend=%d model=%d", len(b.layers), len(mlp.Layers))
+	}
 
 	for i := range mlp.Layers {
 		layer := b.layers[i]
@@ -1433,8 +787,602 @@ func (b *openclMLPBackend) syncParamsToHost(mlp *MLP) error {
 	}
 	return b.queue.Finish()
 }
+func newOpenCLMLPBackend() (*openclMLPBackend, error) {
+	dev, err := pickBestGPU()
+	if err != nil {
+		return nil, err
+	}
+	ctx, err := cl.CreateContext([]*cl.Device{dev})
+	if err != nil {
+		return nil, fmt.Errorf("create OpenCL context: %w", err)
+	}
+	queue, err := ctx.CreateCommandQueue(dev, 0)
+	if err != nil {
+		ctx.Release()
+		return nil, fmt.Errorf("create OpenCL command queue: %w", err)
+	}
+	program, err := ctx.CreateProgramWithSource([]string{mlpOpenCLSource})
+	if err != nil {
+		queue.Release()
+		ctx.Release()
+		return nil, fmt.Errorf("create OpenCL program: %w", err)
+	}
+	if err := program.BuildProgram(nil, ""); err != nil {
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, fmt.Errorf("build OpenCL program: %w", err)
+	}
 
-func (b *openclMLPBackend) clearGradients() error {
+	mk := func(name string) (*cl.Kernel, error) {
+		k, kErr := program.CreateKernel(name)
+		if kErr != nil {
+			return nil, fmt.Errorf("create kernel %q: %w", name, kErr)
+		}
+		return k, nil
+	}
+
+	denseForwardKernel, err := mk("dense_forward")
+	if err != nil {
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	outputDeltaBCEKernel, err := mk("output_delta_bce")
+	if err != nil {
+		denseForwardKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	setOutputDeltasKernel, err := mk("set_output_deltas")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	hiddenDeltaKernel, err := mk("hidden_delta")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	accWeightGradsKernel, err := mk("accumulate_weight_grads")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	accBiasGradsKernel, err := mk("accumulate_bias_grads")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	denseForwardBatchKernel, err := mk("dense_forward_batch")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	outputDeltaBCEBatchKernel, err := mk("output_delta_bce_batch")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	setOutputDeltasBatchKernel, err := mk("set_output_deltas_batch")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	hiddenDeltaBatchKernel, err := mk("hidden_delta_batch")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		setOutputDeltasBatchKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	accWeightGradsBatchKernel, err := mk("accumulate_weight_grads_batch")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		setOutputDeltasBatchKernel.Release()
+		hiddenDeltaBatchKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	accBiasGradsBatchKernel, err := mk("accumulate_bias_grads_batch")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		setOutputDeltasBatchKernel.Release()
+		hiddenDeltaBatchKernel.Release()
+		accWeightGradsBatchKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	applyAdamGradientsKernel, err := mk("adam_update")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		setOutputDeltasBatchKernel.Release()
+		hiddenDeltaBatchKernel.Release()
+		accWeightGradsBatchKernel.Release()
+		accBiasGradsBatchKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	firstInputGradsKernel, err := mk("first_layer_input_grads")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		setOutputDeltasBatchKernel.Release()
+		hiddenDeltaBatchKernel.Release()
+		accWeightGradsBatchKernel.Release()
+		accBiasGradsBatchKernel.Release()
+		applyAdamGradientsKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	backpropAttentionFromInputGradsBatchKernel, err := mk("attention_output_deltas_from_input_grads")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		setOutputDeltasBatchKernel.Release()
+		hiddenDeltaBatchKernel.Release()
+		accWeightGradsBatchKernel.Release()
+		accBiasGradsBatchKernel.Release()
+		applyAdamGradientsKernel.Release()
+		firstInputGradsKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	firstInputGradsBatchKernel, err := mk("first_layer_input_grads_batch")
+	if err != nil {
+		denseForwardKernel.Release()
+		outputDeltaBCEKernel.Release()
+		setOutputDeltasKernel.Release()
+		hiddenDeltaKernel.Release()
+		accWeightGradsKernel.Release()
+		accBiasGradsKernel.Release()
+		denseForwardBatchKernel.Release()
+		outputDeltaBCEBatchKernel.Release()
+		setOutputDeltasBatchKernel.Release()
+		hiddenDeltaBatchKernel.Release()
+		accWeightGradsBatchKernel.Release()
+		accBiasGradsBatchKernel.Release()
+		applyAdamGradientsKernel.Release()
+		firstInputGradsKernel.Release()
+		backpropAttentionFromInputGradsBatchKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
+	backend := &openclMLPBackend{
+		ctx:                        ctx,
+		queue:                      queue,
+		device:                     dev,
+		program:                    program,
+		denseForwardKernel:         denseForwardKernel,
+		outputDeltaBCEKernel:       outputDeltaBCEKernel,
+		setOutputDeltasKernel:      setOutputDeltasKernel,
+		hiddenDeltaKernel:          hiddenDeltaKernel,
+		accWeightGradsKernel:       accWeightGradsKernel,
+		accBiasGradsKernel:         accBiasGradsKernel,
+		denseForwardBatchKernel:    denseForwardBatchKernel,
+		outputDeltaBCEBatchKernel:  outputDeltaBCEBatchKernel,
+		setOutputDeltasBatchKernel: setOutputDeltasBatchKernel,
+		hiddenDeltaBatchKernel:     hiddenDeltaBatchKernel,
+		accWeightGradsBatchKernel:  accWeightGradsBatchKernel,
+		accBiasGradsBatchKernel:    accBiasGradsBatchKernel,
+		adamUpdateKernel:           applyAdamGradientsKernel,
+		firstInputGradsKernel:      firstInputGradsKernel,
+		attentionDeltaInputKernel:  backpropAttentionFromInputGradsBatchKernel,
+		firstInputGradsBatchKernel: firstInputGradsBatchKernel,
+		kernelLocal1D:              make(map[*cl.Kernel]int, 16),
+	}
+
+	for _, kernel := range []*cl.Kernel{
+		denseForwardKernel, outputDeltaBCEKernel, setOutputDeltasKernel, hiddenDeltaKernel,
+		denseForwardBatchKernel, outputDeltaBCEBatchKernel, setOutputDeltasBatchKernel, hiddenDeltaBatchKernel,
+		accWeightGradsBatchKernel, accBiasGradsBatchKernel, accWeightGradsKernel, accBiasGradsKernel,
+		applyAdamGradientsKernel, firstInputGradsKernel, firstInputGradsBatchKernel, backpropAttentionFromInputGradsBatchKernel,
+	} {
+		if kernel != nil {
+			backend.kernelLocal1D[kernel] = chooseKernelLocalSize(dev, kernel)
+		}
+	}
+
+	maxBatch := 1024
+	if raw := strings.TrimSpace(os.Getenv("OPENCL_MAX_BATCH")); raw != "" {
+		if parsed, convErr := strconv.Atoi(raw); convErr == nil && parsed > 0 {
+			maxBatch = parsed
+		}
+	}
+	backend.maxBatchSize = maxBatch
+
+	maxWidth := 8192
+	backend.workBufSize = maxWidth
+
+	alloc := func(size int) (*cl.MemObject, error) {
+		return ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*size)
+	}
+	var allocErr error
+	if backend.bnNeutralMean, allocErr = alloc(maxWidth); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create bnNeutralMean buffer: %w", allocErr)
+	}
+	if backend.bnNeutralVar, allocErr = alloc(maxWidth); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create bnNeutralVar buffer: %w", allocErr)
+	}
+	if backend.scratchA, allocErr = alloc(maxWidth); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create scratchA buffer: %w", allocErr)
+	}
+	if backend.scratchB, allocErr = alloc(maxWidth); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create scratchB buffer: %w", allocErr)
+	}
+	if backend.targetsBuf, allocErr = alloc(maxWidth); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create targets buffer: %w", allocErr)
+	}
+	if backend.inputGradBuf, allocErr = alloc(maxWidth); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create inputGrad buffer: %w", allocErr)
+	}
+	if backend.batchInputBuf, allocErr = alloc(maxWidth * maxBatch); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create batchInput buffer: %w", allocErr)
+	}
+	if backend.batchTargetsBuf, allocErr = alloc(maxWidth * maxBatch); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create batchTargets buffer: %w", allocErr)
+	}
+	if backend.batchScaleBuf, allocErr = alloc(maxBatch); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create batchScale buffer: %w", allocErr)
+	}
+	if backend.attentionDeltaBuf, allocErr = alloc(maxWidth * maxBatch); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create attentionDelta buffer: %w", allocErr)
+	}
+	if backend.inputGradBatchBuf, allocErr = alloc(maxWidth * maxBatch); allocErr != nil {
+		backend.Release()
+		return nil, fmt.Errorf("create inputGradBatch buffer: %w", allocErr)
+	}
+
+	neutralVar := make([]float32, maxWidth)
+	for i := range neutralVar {
+		neutralVar[i] = 1
+	}
+	if _, err := queue.EnqueueWriteBufferFloat32(backend.bnNeutralVar, true, 0, neutralVar, nil); err != nil {
+		backend.Release()
+		return nil, fmt.Errorf("initialize bnNeutralVar buffer: %w", err)
+	}
+
+	return backend, nil
+}
+
+func (b *openclMLPBackend) InitMLP(mlp *MLP) error {
+	if b == nil || b.ctx == nil || b.queue == nil {
+		return fmt.Errorf("OpenCL backend not initialized")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for _, l := range b.layers {
+		if l == nil {
+			continue
+		}
+		if l.weights != nil {
+			l.weights.Release()
+		}
+		if l.biases != nil {
+			l.biases.Release()
+		}
+		if l.bnMean != nil {
+			l.bnMean.Release()
+		}
+		if l.bnVar != nil {
+			l.bnVar.Release()
+		}
+		if l.bnBatchMean != nil {
+			l.bnBatchMean.Release()
+		}
+		if l.bnBatchVar != nil {
+			l.bnBatchVar.Release()
+		}
+		if l.weightM != nil {
+			l.weightM.Release()
+		}
+		if l.weightV != nil {
+			l.weightV.Release()
+		}
+		if l.biasM != nil {
+			l.biasM.Release()
+		}
+		if l.biasV != nil {
+			l.biasV.Release()
+		}
+		if l.outputs != nil {
+			l.outputs.Release()
+		}
+		if l.deltas != nil {
+			l.deltas.Release()
+		}
+		if l.batchOut != nil {
+			l.batchOut.Release()
+		}
+		if l.batchDel != nil {
+			l.batchDel.Release()
+		}
+		if l.gradWBuf != nil {
+			l.gradWBuf.Release()
+		}
+		if l.gradBBuf != nil {
+			l.gradBBuf.Release()
+		}
+	}
+
+	maxBatch := b.maxBatchSize
+	if maxBatch < 1 {
+		maxBatch = 1
+	}
+	b.layers = make([]*openclLayerBuffers, len(mlp.Layers))
+	for i, layer := range mlp.Layers {
+		if layer == nil {
+			return fmt.Errorf("layer %d is nil", i)
+		}
+		outSize := len(layer.Weights)
+		if outSize == 0 {
+			return fmt.Errorf("layer %d has no outputs", i)
+		}
+		if len(layer.Biases) != outSize {
+			return fmt.Errorf("layer %d bias size mismatch: biases=%d outputs=%d", i, len(layer.Biases), outSize)
+		}
+		inSize := len(layer.Weights[0])
+		if inSize == 0 {
+			return fmt.Errorf("layer %d has zero input size", i)
+		}
+		for row := range layer.Weights {
+			if len(layer.Weights[row]) != inSize {
+				return fmt.Errorf("layer %d weight row %d size mismatch: got=%d want=%d", i, row, len(layer.Weights[row]), inSize)
+			}
+		}
+
+		weights := flatten2DF64(layer.Weights)
+		biases := float64To32(layer.Biases)
+		bnMean := float64To32(layer.BNRunningMean)
+		bnVar := float64To32(layer.BNRunningVar)
+		if len(bnMean) != outSize {
+			bnMean = make([]float32, outSize)
+		}
+		if len(bnVar) != outSize {
+			bnVar = make([]float32, outSize)
+			for j := range bnVar {
+				bnVar[j] = 1
+			}
+		}
+
+		wBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(weights))
+		if err != nil {
+			return fmt.Errorf("create weights buffer layer %d: %w", i, err)
+		}
+		if _, err := b.queue.EnqueueWriteBufferFloat32(wBuf, true, 0, weights, nil); err != nil {
+			return fmt.Errorf("upload weights layer %d: %w", i, err)
+		}
+
+		bBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(biases))
+		if err != nil {
+			return fmt.Errorf("create biases buffer layer %d: %w", i, err)
+		}
+		if _, err := b.queue.EnqueueWriteBufferFloat32(bBuf, true, 0, biases, nil); err != nil {
+			return fmt.Errorf("upload biases layer %d: %w", i, err)
+		}
+
+		bnMeanBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(bnMean))
+		if err != nil {
+			return fmt.Errorf("create bnMean buffer layer %d: %w", i, err)
+		}
+		if _, err := b.queue.EnqueueWriteBufferFloat32(bnMeanBuf, true, 0, bnMean, nil); err != nil {
+			return fmt.Errorf("upload bnMean layer %d: %w", i, err)
+		}
+
+		bnVarBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(bnVar))
+		if err != nil {
+			return fmt.Errorf("create bnVar buffer layer %d: %w", i, err)
+		}
+		if _, err := b.queue.EnqueueWriteBufferFloat32(bnVarBuf, true, 0, bnVar, nil); err != nil {
+			return fmt.Errorf("upload bnVar layer %d: %w", i, err)
+		}
+
+		bnBatchMeanBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize)
+		if err != nil {
+			return fmt.Errorf("create bnBatchMean buffer layer %d: %w", i, err)
+		}
+		bnBatchVarBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize)
+		if err != nil {
+			return fmt.Errorf("create bnBatchVar buffer layer %d: %w", i, err)
+		}
+		unitVar := make([]float32, outSize)
+		for j := range unitVar {
+			unitVar[j] = 1
+		}
+		if _, err := b.queue.EnqueueWriteBufferFloat32(bnBatchVarBuf, true, 0, unitVar, nil); err != nil {
+			return fmt.Errorf("upload bnBatchVar layer %d: %w", i, err)
+		}
+
+		wmBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(weights))
+		if err != nil {
+			return fmt.Errorf("create weightM buffer layer %d: %w", i, err)
+		}
+		wvBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(weights))
+		if err != nil {
+			return fmt.Errorf("create weightV buffer layer %d: %w", i, err)
+		}
+		bmBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(biases))
+		if err != nil {
+			return fmt.Errorf("create biasM buffer layer %d: %w", i, err)
+		}
+		bvBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(biases))
+		if err != nil {
+			return fmt.Errorf("create biasV buffer layer %d: %w", i, err)
+		}
+
+		outBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize)
+		if err != nil {
+			return fmt.Errorf("create outputs buffer layer %d: %w", i, err)
+		}
+		deltaBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize)
+		if err != nil {
+			return fmt.Errorf("create deltas buffer layer %d: %w", i, err)
+		}
+		batchOutBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize*maxBatch)
+		if err != nil {
+			return fmt.Errorf("create batchOut buffer layer %d: %w", i, err)
+		}
+		batchDelBuf, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*outSize*maxBatch)
+		if err != nil {
+			return fmt.Errorf("create batchDel buffer layer %d: %w", i, err)
+		}
+		gradW, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(weights))
+		if err != nil {
+			return fmt.Errorf("create gradW buffer layer %d: %w", i, err)
+		}
+		gradB, err := b.ctx.CreateEmptyBuffer(cl.MemReadWrite, 4*len(biases))
+		if err != nil {
+			return fmt.Errorf("create gradB buffer layer %d: %w", i, err)
+		}
+
+		b.layers[i] = &openclLayerBuffers{
+			inSize:      inSize,
+			outSize:     outSize,
+			weights:     wBuf,
+			biases:      bBuf,
+			bnMean:      bnMeanBuf,
+			bnVar:       bnVarBuf,
+			bnBatchMean: bnBatchMeanBuf,
+			bnBatchVar:  bnBatchVarBuf,
+			weightM:     wmBuf,
+			weightV:     wvBuf,
+			biasM:       bmBuf,
+			biasV:       bvBuf,
+			outputs:     outBuf,
+			deltas:      deltaBuf,
+			batchOut:    batchOutBuf,
+			batchDel:    batchDelBuf,
+			gradWBuf:    gradW,
+			gradBBuf:    gradB,
+		}
+	}
+	return nil
+}
+
+func (b *openclMLPBackend) clearGradients(_ *MLP) error {
+	// Update signature
+	return b._clearGradients()
+}
+
+func (b *openclMLPBackend) _clearGradients() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
