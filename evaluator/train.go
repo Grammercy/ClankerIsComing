@@ -321,6 +321,15 @@ type gpuEpochStats struct {
 	totalBCELoss   float64
 	validSnapshots int
 	PhaseAccuracy  [3]float64
+	batches        int
+
+	prepTime              time.Duration
+	attentionForwardTime  time.Duration
+	mainAssembleTime      time.Duration
+	mainForwardTime       time.Duration
+	mainTrainTime         time.Duration
+	attentionBackpropTime time.Duration
+	adamTime              time.Duration
 }
 
 type replayLabelStats struct {
@@ -378,6 +387,107 @@ func mapReplaySwitchAction(state *simulator.BattleState, event parser.Event) (in
 		}
 	}
 	return -1, "unknown_switch_slot"
+}
+
+func stateFromActorPerspective(state *simulator.BattleState, actor string) *simulator.BattleState {
+	if state == nil {
+		return nil
+	}
+	view := simulator.CloneBattleState(state)
+	if actor != "p2" {
+		return view
+	}
+	view.P1, view.P2 = view.P2, view.P1
+	return view
+}
+
+func opponentRevealedSpecies(replay *parser.Replay, actor string, targetIndex int, state *simulator.BattleState) map[string]struct{} {
+	revealed := make(map[string]struct{})
+	if replay == nil || state == nil || targetIndex < 0 {
+		return revealed
+	}
+
+	opponent := "p2"
+	if actor == "p2" {
+		opponent = "p1"
+	}
+
+	limit := targetIndex
+	if limit >= len(replay.Events) {
+		limit = len(replay.Events) - 1
+	}
+	for i := 0; i <= limit; i++ {
+		event := replay.Events[i]
+		if event.Player != opponent {
+			continue
+		}
+		switch event.Type {
+		case "switch", "drag", "replace":
+			species := strings.TrimSpace(event.Value)
+			if species != "" {
+				revealed[gamedata.NormalizeID(species)] = struct{}{}
+			}
+		}
+	}
+
+	oppPlayer := &state.P2
+	if actor == "p2" {
+		oppPlayer = &state.P1
+	}
+	if oppActive := oppPlayer.GetActive(); oppActive != nil {
+		if key := gamedata.NormalizeID(oppActive.Species); key != "" {
+			revealed[key] = struct{}{}
+		}
+	}
+
+	return revealed
+}
+
+func applyUnknownOpponentMask(state *simulator.BattleState, actor string, replay *parser.Replay, targetIndex int) {
+	if state == nil {
+		return
+	}
+
+	revealed := opponentRevealedSpecies(replay, actor, targetIndex, state)
+	oppPlayer := &state.P2
+	if actor == "p2" {
+		oppPlayer = &state.P1
+	}
+
+	for i := 0; i < oppPlayer.TeamSize; i++ {
+		poke := &oppPlayer.Team[i]
+		if poke.IsActive {
+			continue
+		}
+		if _, ok := revealed[gamedata.NormalizeID(poke.Species)]; ok {
+			continue
+		}
+
+		poke.Name = "Unknown"
+		poke.Species = "Unknown"
+		poke.Ability = ""
+		poke.Item = ""
+		poke.TeraType = ""
+		poke.Moves = [4]string{}
+		poke.NumMoves = 0
+		poke.MovePP = [4]int{}
+		poke.MoveMaxPP = [4]int{}
+		poke.LockedMove = ""
+		poke.Stats = simulator.Stats{}
+		if !poke.Fainted {
+			poke.MaxHP = 100
+			poke.HP = 100
+		}
+	}
+}
+
+func buildActorPerspectiveState(replay *parser.Replay, eventIndex int, actor string) (*simulator.BattleState, error) {
+	state, err := simulator.FastForwardToEvent(replay, eventIndex)
+	if err != nil {
+		return nil, err
+	}
+	applyUnknownOpponentMask(state, actor, replay, eventIndex)
+	return stateFromActorPerspective(state, actor), nil
 }
 
 func mapReplayMoveSlot(state *simulator.BattleState, moveName string) (int, string, bool) {
@@ -537,19 +647,31 @@ func appendLatentBootstrapSnapshots(samples []preparedSnapshot, base preparedSna
 	return samples
 }
 
+func matchOutcomeForActor(matchWinner float64, actor string) float64 {
+	if actor == "p2" {
+		return 1.0 - matchWinner
+	}
+	return matchWinner
+}
+
 func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, eloWeight float64, gameID uint64) ([]preparedSnapshot, replayLabelStats) {
 	stats := newReplayLabelStats()
 	samples := make([]preparedSnapshot, 0, (len(replay.Events)/2)*trainLatentBootstrapPasses)
 
 	for i, event := range replay.Events {
-		if event.Player != "p1" || event.Turn < TrainingTurnThreshold {
+		if event.Turn < TrainingTurnThreshold {
 			continue
 		}
+		if event.Player != "p1" && event.Player != "p2" {
+			continue
+		}
+		actor := event.Player
+		actorWinner := matchOutcomeForActor(matchWinner, actor)
 
 		switch event.Type {
 		case "switch":
 			stats.candidates++
-			state, err := simulator.FastForwardToEvent(replay, i-1)
+			state, err := buildActorPerspectiveState(replay, i-1, actor)
 			if err != nil {
 				stats.skip("fastforward_error")
 				continue
@@ -559,7 +681,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.skip(reason)
 				continue
 			}
-			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight, event.Turn, replay.Turns, gameID)
+			snapshot, reason, ok := buildPreparedSnapshot(state, action, actorWinner, eloWeight, event.Turn, replay.Turns, gameID)
 			if !ok {
 				stats.skip(reason)
 				continue
@@ -571,11 +693,11 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 		case "move":
 			// Tera move training sample is sourced from the terastallize event
 			// to capture pre-tera state. Skip this move if tera already happened this turn.
-			if hasPriorTerastallizeInTurn(replay.Events, i, "p1") {
+			if hasPriorTerastallizeInTurn(replay.Events, i, actor) {
 				continue
 			}
 			stats.candidates++
-			state, err := simulator.FastForwardToEvent(replay, i-1)
+			state, err := buildActorPerspectiveState(replay, i-1, actor)
 			if err != nil {
 				stats.skip("fastforward_error")
 				continue
@@ -589,7 +711,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.moveSlotFallbacks++
 			}
 			action := simulator.ActionMove1 + slot
-			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight, event.Turn, replay.Turns, gameID)
+			snapshot, reason, ok := buildPreparedSnapshot(state, action, actorWinner, eloWeight, event.Turn, replay.Turns, gameID)
 			if !ok {
 				stats.skip(reason)
 				continue
@@ -600,12 +722,12 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 
 		case "terastallize":
 			stats.candidates++
-			moveIdx := findNextMoveInTurn(replay.Events, i, "p1")
+			moveIdx := findNextMoveInTurn(replay.Events, i, actor)
 			if moveIdx == -1 {
 				stats.skip("tera_without_followup_move")
 				continue
 			}
-			state, err := simulator.FastForwardToEvent(replay, i-1)
+			state, err := buildActorPerspectiveState(replay, i-1, actor)
 			if err != nil {
 				stats.skip("fastforward_error")
 				continue
@@ -619,7 +741,7 @@ func buildReplayChosenActionSamples(replay *parser.Replay, matchWinner float64, 
 				stats.moveSlotFallbacks++
 			}
 			action := simulator.ActionTeraMove1 + slot
-			snapshot, reason, ok := buildPreparedSnapshot(state, action, matchWinner, eloWeight, event.Turn, replay.Turns, gameID)
+			snapshot, reason, ok := buildPreparedSnapshot(state, action, actorWinner, eloWeight, event.Turn, replay.Turns, gameID)
 			if !ok {
 				stats.skip(reason)
 				continue
@@ -640,46 +762,77 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 	batch := make([]preparedSnapshot, 0, kernelBatchSize)
 	defaultWeights := uniformSlotWeights()
 
+	rawSlotsBatch := make([][]float64, kernelBatchSize)
+	targetsBatch := make([][]float64, kernelBatchSize)
+	eloWeightsBatch := make([]float64, kernelBatchSize)
+	prefixBatch := make([][]float64, kernelBatchSize)
+	mainInputsBatch := make([][]float64, kernelBatchSize)
+	attentionWeightsBatch := make([][]float64, kernelBatchSize)
+	slotDeltaBatch := make([][]float64, kernelBatchSize)
+	attentionDeltaBatch := make([][]float64, kernelBatchSize)
+
+	for i := 0; i < kernelBatchSize; i++ {
+		targetsBatch[i] = make([]float64, MainOutputSize)
+		prefixBatch[i] = make([]float64, TotalGlobals)
+		mainInputsBatch[i] = make([]float64, TotalFeatures)
+		attentionWeightsBatch[i] = make([]float64, SlotAttentionSlots)
+		slotDeltaBatch[i] = make([]float64, SlotAttentionSlots)
+		attentionDeltaBatch[i] = make([]float64, SlotAttentionOutputSize)
+	}
+
 	flushKernelBatch := func() {
 		n := len(batch)
 		if n == 0 {
 			return
 		}
+		stats.batches++
 
-		rawSlotsBatch := make([][]float64, n)
-		targetsBatch := make([][]float64, n)
-		eloWeightsBatch := make([]float64, n)
-		prefixBatch := make([][]float64, n)
-		for i, sample := range batch {
+		prepStart := time.Now()
+		for i := 0; i < n; i++ {
+			sample := batch[i]
 			rawSlotsBatch[i] = sample.rawSlots
-			targetsBatch[i] = mainTargetsWithMaskedLatents(sample.targets)
+
+			targets := targetsBatch[i]
+			for j := range targets {
+				targets[j] = -1.0
+			}
+			actionLimit := MainActionOutputSize
+			if actionLimit > len(targets) {
+				actionLimit = len(targets)
+			}
+			if actionLimit > len(sample.targets) {
+				actionLimit = len(sample.targets)
+			}
+			copy(targets[:actionLimit], sample.targets[:actionLimit])
+
 			eloWeightsBatch[i] = sample.eloWeight
-			prefixBatch[i] = append([]float64(nil), sample.prefix...)
+
+			prefix := prefixBatch[i]
+			copy(prefix, sample.prefix)
+			if len(sample.prefix) < len(prefix) {
+				clear(prefix[len(sample.prefix):])
+			}
 		}
+		stats.prepTime += time.Since(prepStart)
 
-		var rawAttentionBatch [][]float64
-		var bceLoss float64
-		var outputsBatch [][]float64
-		var attentionWeightsBatch [][]float64
-
-		rawAttentionBatch = attentionMLP.ForwardBatch(rawSlotsBatch)
-		attentionWeightsBatch = make([][]float64, n)
-		for sampleIdx := range batch {
+		attentionForwardStart := time.Now()
+		rawAttentionBatch := attentionMLP.ForwardBatch(rawSlotsBatch[:n])
+		stats.attentionForwardTime += time.Since(attentionForwardStart)
+		for sampleIdx := 0; sampleIdx < n; sampleIdx++ {
 			slotWeights, ok := attentionWeightsFromOutput(rawAttentionBatch[sampleIdx])
 			if !ok {
 				slotWeights = defaultWeights
 			}
-			attentionWeights := make([]float64, SlotAttentionSlots)
-			copy(attentionWeights, slotWeights[:])
-
-			attentionWeightsBatch[sampleIdx] = attentionWeights
+			copy(attentionWeightsBatch[sampleIdx], slotWeights[:])
 		}
 
+		var bceLoss float64
+		var outputsBatch [][]float64
 		for step := 0; step < LatentRecurrenceSteps; step++ {
-			mainInputsBatch := make([][]float64, n)
-			for sampleIdx := range batch {
-				mainInputs := make([]float64, TotalFeatures)
-				copy(mainInputs, prefixBatch[sampleIdx])
+			assembleStart := time.Now()
+			for sampleIdx := 0; sampleIdx < n; sampleIdx++ {
+				mainInputs := mainInputsBatch[sampleIdx]
+				copy(mainInputs[:TotalGlobals], prefixBatch[sampleIdx])
 				idx := TotalGlobals
 				for slotIdx := 0; slotIdx < SlotAttentionSlots; slotIdx++ {
 					w := attentionWeightsBatch[sampleIdx][slotIdx]
@@ -689,13 +842,17 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 						idx++
 					}
 				}
-				mainInputsBatch[sampleIdx] = mainInputs
 			}
+			stats.mainAssembleTime += time.Since(assembleStart)
 
 			if step == LatentRecurrenceSteps-1 {
-				bceLoss, outputsBatch = mlp.CalculateBCELocalGradientsBatch(mainInputsBatch, targetsBatch, eloWeightsBatch)
+				mainTrainStart := time.Now()
+				bceLoss, outputsBatch = mlp.CalculateBCELocalGradientsBatch(mainInputsBatch[:n], targetsBatch[:n], eloWeightsBatch[:n])
+				stats.mainTrainTime += time.Since(mainTrainStart)
 			} else {
-				stepOutputs := mlp.ForwardBatch(mainInputsBatch)
+				mainForwardStart := time.Now()
+				stepOutputs := mlp.ForwardBatch(mainInputsBatch[:n])
+				stats.mainForwardTime += time.Since(mainForwardStart)
 				for i := 0; i < n; i++ {
 					setPrefixLatentsFromOutput(prefixBatch[i], stepOutputs[i])
 				}
@@ -723,37 +880,41 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 		}
 		stats.PhaseAccuracy = tracker.GetPhaseAccuracy()
 
+		attentionBackpropStart := time.Now()
 		attentionDeltaFlat := mlp.AttentionOutputDeltasFromFirstLayerBatch(
 			TotalGlobals,
-			rawSlotsBatch,
-			attentionWeightsBatch,
-			eloWeightsBatch,
+			rawSlotsBatch[:n],
+			attentionWeightsBatch[:n],
+			eloWeightsBatch[:n],
 			FeaturesPerSlot,
 			SlotAttentionSlots,
 		)
-		slotDeltaBatch := make([][]float64, n)
 		for sample := 0; sample < n; sample++ {
 			base := sample * SlotAttentionSlots
-			row := make([]float64, SlotAttentionSlots)
-			copy(row, attentionDeltaFlat[base:base+SlotAttentionSlots])
-			slotDeltaBatch[sample] = row
+			copy(slotDeltaBatch[sample], attentionDeltaFlat[base:base+SlotAttentionSlots])
+			copy(attentionDeltaBatch[sample], slotDeltaBatch[sample])
 		}
 
-		attentionDeltaBatch := buildAttentionOutputDeltasBatch(rawAttentionBatch, slotDeltaBatch)
-		attentionMLP.BackpropGivenDeltasBatch(rawSlotsBatch, attentionDeltaBatch, eloWeightsBatch)
+		attentionMLP.BackpropGivenDeltasBatch(rawSlotsBatch[:n], attentionDeltaBatch[:n], eloWeightsBatch[:n])
+		stats.attentionBackpropTime += time.Since(attentionBackpropStart)
 
 		stats.totalBCELoss += bceLoss
 		stats.totalLoss += bceLoss
 
 		workerBatchCount += n
 		for workerBatchCount >= BatchSize {
+			adamStart := time.Now()
 			mlp.ApplyAdamGradients(nil, float64(BatchSize), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
 			attentionMLP.ApplyAdamGradients(nil, float64(BatchSize), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
+			stats.adamTime += time.Since(adamStart)
 			workerBatchCount -= BatchSize
 		}
 		batch = batch[:0]
 
-		progressCh <- stats
+		select {
+		case progressCh <- stats:
+		default:
+		}
 	}
 
 	for sample := range samples {
@@ -765,8 +926,10 @@ func runGPUEpochTrainer(mlp *MLP, attentionMLP *MLP, kernelBatchSize int, learni
 	flushKernelBatch()
 
 	if workerBatchCount > 0 {
+		adamStart := time.Now()
 		mlp.ApplyAdamGradients(nil, float64(workerBatchCount), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
 		attentionMLP.ApplyAdamGradients(nil, float64(workerBatchCount), learningRate, WeightDecay, 0.9, 0.999, 1e-8)
+		stats.adamTime += time.Since(adamStart)
 	}
 	return stats
 }
@@ -877,6 +1040,10 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		samples := make(chan preparedSnapshot, kernelBatchSize*8)
 		statsCh := make(chan gpuEpochStats, 1)
 		progressCh := make(chan gpuEpochStats, 1)
+		var trainerDurationNanos int64
+		var parseDurationNanos int64
+		var sampleBuildDurationNanos int64
+		var sampleSendWaitNanos int64
 
 		go func() {
 			lastReport := time.Now()
@@ -900,7 +1067,9 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		}()
 
 		go func() {
+			start := time.Now()
 			stats := runGPUEpochTrainer(mlp, attentionMLP, kernelBatchSize, learningRate, samples, progressCh)
+			atomic.StoreInt64(&trainerDurationNanos, int64(time.Since(start)))
 			close(progressCh)
 			statsCh <- stats
 		}()
@@ -908,6 +1077,7 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		var parserWG sync.WaitGroup
 		labelStats := newReplayLabelStats()
 		var labelStatsMu sync.Mutex
+		producerStart := time.Now()
 		for w := 0; w < numWorkers; w++ {
 			parserWG.Add(1)
 			go func() {
@@ -926,7 +1096,9 @@ func TrainNetwork(replaysDir string, epochs int) error {
 						localStats.skip("json_without_action_labels")
 						continue
 					} else if strings.HasSuffix(entry.Name(), ".log") {
+						parseStart := time.Now()
 						replay, err := parser.ParseLogFile(filePath)
+						atomic.AddInt64(&parseDurationNanos, int64(time.Since(parseStart)))
 						if err != nil || replay.Turns < 5 {
 							localStats.skip("invalid_or_short_replay")
 							continue
@@ -943,13 +1115,17 @@ func TrainNetwork(replaysDir string, epochs int) error {
 						}
 
 						gameID := atomic.AddUint64(&globalGameCounter, 1)
+						buildStart := time.Now()
 						replaySamples, replayStats := buildReplayChosenActionSamples(replay, matchWinner, eloWeight, gameID)
+						atomic.AddInt64(&sampleBuildDurationNanos, int64(time.Since(buildStart)))
 						localStats.merge(replayStats)
 						for _, sample := range replaySamples {
 							if !reserveSample() {
 								break
 							}
+							sendStart := time.Now()
 							samples <- sample
+							atomic.AddInt64(&sampleSendWaitNanos, int64(time.Since(sendStart)))
 						}
 					} else {
 						localStats.skip("unsupported_file_extension")
@@ -969,7 +1145,7 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		close(jobs)
 		parserWG.Wait()
 		close(samples)
-		parserWG.Wait()
+		producerElapsed := time.Since(producerStart)
 
 		stats := <-statsCh
 		fmt.Printf("\n") // Clear progress line
@@ -1018,6 +1194,22 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		eta := avgEpoch * time.Duration(remainingEpochs)
 		fmt.Printf("  -> Epoch time: %s | Elapsed: %s | ETA: %s\n",
 			formatDurationCompact(epochElapsed), formatDurationCompact(time.Since(trainingStart)), formatDurationCompact(eta))
+		fmt.Printf("  -> Pipeline timing: producer=%s trainer=%s (batches=%d)\n",
+			formatDurationCompact(producerElapsed),
+			formatDurationCompact(time.Duration(atomic.LoadInt64(&trainerDurationNanos))),
+			stats.batches)
+		fmt.Printf("  -> Producer breakdown (summed workers): parse=%s sample-build=%s send-wait=%s\n",
+			formatDurationCompact(time.Duration(atomic.LoadInt64(&parseDurationNanos))),
+			formatDurationCompact(time.Duration(atomic.LoadInt64(&sampleBuildDurationNanos))),
+			formatDurationCompact(time.Duration(atomic.LoadInt64(&sampleSendWaitNanos))))
+		fmt.Printf("  -> Trainer breakdown (summed batches): prep=%s attn-fwd=%s main-assemble=%s main-fwd=%s main-train=%s attn-backprop=%s adam=%s\n",
+			formatDurationCompact(stats.prepTime),
+			formatDurationCompact(stats.attentionForwardTime),
+			formatDurationCompact(stats.mainAssembleTime),
+			formatDurationCompact(stats.mainForwardTime),
+			formatDurationCompact(stats.mainTrainTime),
+			formatDurationCompact(stats.attentionBackpropTime),
+			formatDurationCompact(stats.adamTime))
 
 		// Save weights if loss improved (went down)
 		if avgLoss < bestMSE {
