@@ -862,12 +862,14 @@ func (b *openclMLPBackend) calculateBCELocalGradients(mlp *MLP, inputs []float64
 	b.queue.EnqueueReadBufferFloat32(last.outputs, true, 0, out32, nil)
 	loss := 0.0
 	deltas32 := make([]float32, last.outSize)
+	validTargets := 0.0
 	for i := range out32 {
 		t := float32(targets[i])
 		o := out32[i]
 		if t < 0 {
 			deltas32[i] = 0
 		} else {
+			validTargets++
 			o64 := float64(o)
 			if o64 < 1e-7 {
 				o64 = 1e-7
@@ -876,10 +878,20 @@ func (b *openclMLPBackend) calculateBCELocalGradients(mlp *MLP, inputs []float64
 				o64 = 1.0 - 1e-7
 			}
 			loss -= float64(t)*math.Log(o64) + float64(1-t)*math.Log(1.0-o64)
-			deltas32[i] = (t - o) * float32(eloWeight)
 		}
 	}
-	loss *= eloWeight
+	scale := float32(0.0)
+	if validTargets > 0 {
+		loss /= validTargets
+		scale = float32(eloWeight / validTargets)
+	}
+	for i := range out32 {
+		t := float32(targets[i])
+		if t < 0 {
+			continue
+		}
+		deltas32[i] = (t - out32[i]) * scale
+	}
 	b.queue.EnqueueWriteBufferFloat32(last.deltas, false, 0, deltas32, nil)
 	for i := len(mlp.gpuLayers) - 1; i >= 0; i-- {
 		layer := mlp.gpuLayers[i]
@@ -1111,12 +1123,14 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 	targets32, scale32 := make([]float32, batchSize*last.outSize), make([]float32, batchSize)
 	totalLoss := 0.0
 	for s := 0; s < batchSize; s++ {
-		scale32[s] = float32(eloWeights[s])
+		valid := 0.0
+		sampleLoss := 0.0
 		for i := 0; i < last.outSize; i++ {
 			idx := s*last.outSize + i
 			t := float32(targetsBatch[s][i])
 			targets32[idx] = t
 			if t >= 0 {
+				valid++
 				o := float64(outFlat[idx])
 				if o < 1e-7 {
 					o = 1e-7
@@ -1124,8 +1138,14 @@ func (b *openclMLPBackend) calculateBCELocalGradientsBatch(mlp *MLP, inputsBatch
 				if o > 1.0-1e-7 {
 					o = 1.0 - 1e-7
 				}
-				totalLoss -= eloWeights[s] * (float64(t)*math.Log(o) + (1.0-float64(t))*math.Log(1.0-o))
+				sampleLoss -= float64(t)*math.Log(o) + (1.0-float64(t))*math.Log(1.0-o)
 			}
+		}
+		if valid > 0 {
+			totalLoss += sampleLoss / valid
+			scale32[s] = float32(eloWeights[s] / valid)
+		} else {
+			scale32[s] = 0.0
 		}
 	}
 	b.queue.EnqueueWriteBufferFloat32(b.batchTargetsBuf, false, 0, targets32, nil)

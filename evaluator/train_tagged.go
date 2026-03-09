@@ -179,7 +179,6 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 	const patience = 3
 	const lrDecay = 0.5
 	const minLR = 1e-5
-	const exploratorySamplesPerEpoch int64 = 4000
 	numWorkers := runtime.NumCPU()
 	kernelBatchSize := tuneKernelBatchSize(mlp, attentionMLP)
 	trainingStart := time.Now()
@@ -194,28 +193,6 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 		if len(epochEntries) > maxPerEpoch {
 			epochEntries = epochEntries[:maxPerEpoch]
 		}
-		explorationPhase := learningRate > normalScheduleLR
-		explorationBudget := int64(0)
-		if explorationPhase {
-			explorationBudget = exploratorySamplesPerEpoch
-			fmt.Printf("  -> Exploration epoch sample budget: %d\n", explorationBudget)
-		}
-		var samplesQueued int64
-		reserveSample := func() bool {
-			if explorationBudget <= 0 {
-				return true
-			}
-			for {
-				cur := atomic.LoadInt64(&samplesQueued)
-				if cur >= explorationBudget {
-					return false
-				}
-				if atomic.CompareAndSwapInt64(&samplesQueued, cur, cur+1) {
-					return true
-				}
-			}
-		}
-
 		jobs := make(chan os.DirEntry, len(epochEntries))
 		samples := make(chan preparedSnapshot, kernelBatchSize*8)
 		statsCh := make(chan gpuEpochStats, 1)
@@ -255,9 +232,6 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 				defer workerWG.Done()
 				local := taggedDataLoadStats{}
 				for entry := range jobs {
-					if explorationBudget > 0 && atomic.LoadInt64(&samplesQueued) >= explorationBudget {
-						break
-					}
 					if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 						continue
 					}
@@ -297,9 +271,6 @@ func TrainNetworkFromTaggedWithValidation(taggedDir string, testDir string, epoc
 						prepared.GameID = gameID
 						if maxTurn > 0 {
 							prepared.TurnPercent = float64(tagged.Turn) / float64(maxTurn)
-						}
-						if !reserveSample() {
-							break
 						}
 						samples <- prepared
 						local.samplesLoaded++

@@ -166,7 +166,8 @@ __kernel void adam_update(
 
     m[gid] = mNew;
     v[gid] = vNew;
-    params[gid] = params[gid] * (1.0f - weightDecay) + lr * (mNew * beta1CorrInv) / (sqrt(vNew * beta2CorrInv) + epsilon);
+    // Decoupled weight decay should be scaled by learning rate.
+    params[gid] = params[gid] * (1.0f - lr * weightDecay) + lr * (mNew * beta1CorrInv) / (sqrt(vNew * beta2CorrInv) + epsilon);
     grads[gid] = 0.0f;
 }
 
