@@ -8,15 +8,23 @@ import (
 	"github.com/pokemon-engine/simulator"
 )
 
-// FeaturesPerSlot is the number of features extracted per Pokemon slot
-// 53 base + (6 per move * 4 moves) + 3 padding = 80
-const FeaturesPerSlot = 80
+const (
+	AbilityHashBuckets = 16
+	ItemHashBuckets    = 16
+	VolatileBits       = 18
+	MoveFeatures       = 8
+	PlayerGlobals      = 7
+)
 
-// TotalSlotFeatures is 12 slots * 80 features
-const TotalSlotFeatures = 12 * FeaturesPerSlot // 960
+// FeaturesPerSlot is the number of features extracted per Pokemon slot.
+// 7 base + ability(16) + item(16) + volatiles(18) + species(25) + (8 per move * 4 moves) = 114
+const FeaturesPerSlot = 114
 
-// FieldFeatures = 5 weather one-hot + 5 terrain one-hot + 1 trick room + 1 gravity = 12
-const FieldFeatures = 12
+// TotalSlotFeatures is 12 slots * FeaturesPerSlot features
+const TotalSlotFeatures = 12 * FeaturesPerSlot // 1368
+
+// FieldFeatures = 5 weather one-hot + weather turns + 5 terrain one-hot + terrain turns + trick room turns + gravity turns = 16
+const FieldFeatures = 16
 
 // SideFeatures = 10 per side (StealthRock, Spikes, ToxicSpikes, StickyWeb, Reflect, LightScreen, AuroraVeil, Tailwind, Safeguard, Mist)
 const SideFeatures = 10
@@ -26,6 +34,12 @@ const BoostFeatures = 10
 
 // MatchupFeatures = 2 (P1 vs P2 type effectiveness, P2 vs P1 type effectiveness)
 const MatchupFeatures = 2
+
+// SpeedOrderFeatures = 4 (P1 speed, P2 speed, speed diff, P1 moves first at equal priority)
+const SpeedOrderFeatures = 4
+
+// ActiveProgressFeatures = 8 (sleep/freeze/toxic/turns-active for both actives)
+const ActiveProgressFeatures = 8
 
 // LatentTokenFeatures = 2 (reasoning token, prediction token)
 const LatentTokenFeatures = 2
@@ -47,11 +61,11 @@ const (
 	LatentRecurrenceSteps      = 5
 )
 
-// TotalGlobals = 6 player globals + 12 field + 20 side (10*2) + 10 boosts (5*2) + 2 matchup + 2 latent tokens
-const TotalGlobals = 6 + FieldFeatures + 2*SideFeatures + BoostFeatures + MatchupFeatures + LatentTokenFeatures // 52
+// TotalGlobals = 14 player globals + field + 20 side + 10 boosts + 2 matchup + 4 speed/order + 8 status progress + 2 latent
+const TotalGlobals = 2*PlayerGlobals + FieldFeatures + 2*SideFeatures + BoostFeatures + MatchupFeatures + SpeedOrderFeatures + ActiveProgressFeatures + LatentTokenFeatures // 76
 
 // TotalFeatures is globals + slot features
-const TotalFeatures = TotalGlobals + TotalSlotFeatures // 1012
+const TotalFeatures = TotalGlobals + TotalSlotFeatures // 1444
 
 var (
 	GlobalMLP          *MLP
@@ -286,27 +300,22 @@ func Vectorize(state *simulator.BattleState, attention *MLP, out *[TotalFeatures
 func VectorizeWithLatentTokens(state *simulator.BattleState, attention *MLP, out *[TotalFeatures]float64, cache *InferenceCache, latentReasoningToken float64, latentPredictionToken float64) {
 	idx := 0
 
-	// 6 player globals
+	// 14 player globals (7 per side)
 	p1Globals, p1Slots := vectorizePlayerFeatures(&state.P1, state)
 	p2Globals, p2Slots := vectorizePlayerFeatures(&state.P2, state)
+	for i := 0; i < len(p1Globals); i++ {
+		out[idx] = p1Globals[i]
+		idx++
+	}
+	for i := 0; i < len(p2Globals); i++ {
+		out[idx] = p2Globals[i]
+		idx++
+	}
 
-	out[idx] = p1Globals[0]
-	idx++
-	out[idx] = p1Globals[1]
-	idx++
-	out[idx] = p2Globals[0]
-	idx++
-	out[idx] = p2Globals[1]
-	idx++
-	out[idx] = p1Globals[2]
-	idx++
-	out[idx] = p2Globals[2]
-	idx++
-
-	// 11 field condition features
+	// Field condition features
 	vectorizeFieldConditions(&state.Field, out, &idx)
 
-	// 14 side condition features (7 per side)
+	// Side condition features
 	vectorizeSideConditions(&state.P1.Side, out, &idx)
 	vectorizeSideConditions(&state.P2.Side, out, &idx)
 
@@ -317,13 +326,19 @@ func VectorizeWithLatentTokens(state *simulator.BattleState, attention *MLP, out
 	// 2 type matchup features
 	vectorizeMatchup(state, out, &idx)
 
+	// 4 speed/order features
+	vectorizeSpeedOrderFeatures(state, out, &idx)
+
+	// 8 active status progression features
+	vectorizeActiveProgressFeatures(state, out, &idx)
+
 	// 2 latent features
 	vectorizeLatentTokens(out, &idx, latentReasoningToken, latentPredictionToken)
 
 	// Track where slots begin for attention processing
 	slotsStartIdx := idx
 
-	// Combine all 12 slots (2040 features) into out buffer
+	// Combine all 12 slots into out buffer
 	for i := 0; i < len(p1Slots); i++ {
 		out[idx] = p1Slots[i]
 		idx++
@@ -360,48 +375,48 @@ func vectorizeLatentTokens(out *[TotalFeatures]float64, idx *int, latentReasonin
 	*idx++
 }
 
-// vectorizeFieldConditions writes 11 features for global field state into the out array
+// vectorizeFieldConditions writes field identity and exact timer features.
 func vectorizeFieldConditions(field *simulator.FieldConditions, out *[TotalFeatures]float64, idx *int) {
+	for i := 0; i < 16; i++ {
+		out[*idx+i] = 0.0
+	}
+
 	// Weather one-hot (5 bits): Sun, Rain, Sand, Snow, None
 	wIdx := 4 // Default to "None"
-	w := field.Weather
-	if w == "SunnyDay" || w == "DesolateLand" || w == "Sun" {
+	w := normalizeWeatherForVectorize(field.Weather)
+	if w == "sunnyday" {
 		wIdx = 0
-	} else if w == "RainDance" || w == "PrimordialSea" || w == "Rain" {
+	} else if w == "raindance" {
 		wIdx = 1
-	} else if w == "Sandstorm" || w == "Sand" {
+	} else if w == "sandstorm" {
 		wIdx = 2
-	} else if w == "Snowscape" || w == "Hail" || w == "Snow" {
+	} else if w == "snowscape" {
 		wIdx = 3
 	}
 	out[*idx+wIdx] = 1.0
 	*idx += 5
+	out[*idx] = math.Min(float64(field.WeatherTurns)/8.0, 1.0)
+	*idx++
 
 	// Terrain one-hot (5 bits): Electric, Grassy, Psychic, Misty, None
 	tIdx := 4 // Default to "None"
-	t := field.Terrain
-	if t == "Electric Terrain" || t == "Electric" {
+	t := normalizeTerrainForVectorize(field.Terrain)
+	if t == "electricterrain" {
 		tIdx = 0
-	} else if t == "Grassy Terrain" || t == "Grassy" {
+	} else if t == "grassyterrain" {
 		tIdx = 1
-	} else if t == "Psychic Terrain" || t == "Psychic" {
+	} else if t == "psychicterrain" {
 		tIdx = 2
-	} else if t == "Misty Terrain" || t == "Misty" {
+	} else if t == "mistyterrain" {
 		tIdx = 3
 	}
 	out[*idx+tIdx] = 1.0
 	*idx += 5
-
-	// Trick Room
-	if field.TrickRoom {
-		out[*idx] = 1.0
-	}
+	out[*idx] = math.Min(float64(field.TerrainTurns)/8.0, 1.0)
 	*idx++
-
-	// Gravity
-	if field.Gravity {
-		out[*idx] = 1.0
-	}
+	out[*idx] = math.Min(float64(field.TrickRoomTurns)/5.0, 1.0)
+	*idx++
+	out[*idx] = math.Min(float64(field.GravityTurns)/5.0, 1.0)
 	*idx++
 }
 
@@ -415,24 +430,12 @@ func vectorizeSideConditions(side *simulator.SideConditions, out *[TotalFeatures
 	if side.StickyWeb {
 		out[*idx+3] = 1.0
 	}
-	if side.ReflectTurns > 0 {
-		out[*idx+4] = 1.0
-	}
-	if side.LightScreenTurns > 0 {
-		out[*idx+5] = 1.0
-	}
-	if side.AuroraVeilTurns > 0 {
-		out[*idx+6] = 1.0
-	}
-	if side.TailwindTurns > 0 {
-		out[*idx+7] = 1.0
-	}
-	if side.SafeguardTurns > 0 {
-		out[*idx+8] = 1.0
-	}
-	if side.MistTurns > 0 {
-		out[*idx+9] = 1.0
-	}
+	out[*idx+4] = math.Min(float64(side.ReflectTurns)/8.0, 1.0)
+	out[*idx+5] = math.Min(float64(side.LightScreenTurns)/8.0, 1.0)
+	out[*idx+6] = math.Min(float64(side.AuroraVeilTurns)/8.0, 1.0)
+	out[*idx+7] = math.Min(float64(side.TailwindTurns)/4.0, 1.0)
+	out[*idx+8] = math.Min(float64(side.SafeguardTurns)/5.0, 1.0)
+	out[*idx+9] = math.Min(float64(side.MistTurns)/5.0, 1.0)
 	*idx += 10
 }
 
@@ -481,9 +484,224 @@ func vectorizeMatchup(state *simulator.BattleState, out *[TotalFeatures]float64,
 	*idx += 2
 }
 
-// vectorizePlayerFeatures extracts 3 globals and 1020 slot features (6 slots × 170 features)
-func vectorizePlayerFeatures(player *simulator.PlayerState, state *simulator.BattleState) ([3]float64, [6 * FeaturesPerSlot]float64) {
-	var globals [3]float64
+func vectorizeSpeedOrderFeatures(state *simulator.BattleState, out *[TotalFeatures]float64, idx *int) {
+	p1Active := state.P1.GetActive()
+	p2Active := state.P2.GetActive()
+	if p1Active == nil || p2Active == nil {
+		*idx += SpeedOrderFeatures
+		return
+	}
+
+	p1Speed := effectiveSpeedForOrder(state, p1Active, &state.P1.Side)
+	p2Speed := effectiveSpeedForOrder(state, p2Active, &state.P2.Side)
+	out[*idx] = math.Min(p1Speed/1200.0, 1.0)
+	out[*idx+1] = math.Min(p2Speed/1200.0, 1.0)
+	diff := (p1Speed - p2Speed) / 1200.0
+	if diff < -1.0 {
+		diff = -1.0
+	}
+	if diff > 1.0 {
+		diff = 1.0
+	}
+	out[*idx+2] = (diff + 1.0) / 2.0
+
+	p1First := 0.0
+	if state.Field.TrickRoom {
+		if p1Speed < p2Speed {
+			p1First = 1.0
+		}
+	} else if p1Speed > p2Speed {
+		p1First = 1.0
+	}
+	out[*idx+3] = p1First
+
+	*idx += SpeedOrderFeatures
+}
+
+func vectorizeActiveProgressFeatures(state *simulator.BattleState, out *[TotalFeatures]float64, idx *int) {
+	p1Active := state.P1.GetActive()
+	p2Active := state.P2.GetActive()
+	if p1Active != nil {
+		out[*idx] = math.Min(float64(p1Active.SleepTurns)/3.0, 1.0)
+		out[*idx+2] = math.Min(float64(p1Active.FreezeTurns)/5.0, 1.0)
+		out[*idx+4] = math.Min(float64(p1Active.ToxicCounter)/15.0, 1.0)
+		out[*idx+6] = math.Min(float64(p1Active.TurnsActive)/20.0, 1.0)
+	}
+	if p2Active != nil {
+		out[*idx+1] = math.Min(float64(p2Active.SleepTurns)/3.0, 1.0)
+		out[*idx+3] = math.Min(float64(p2Active.FreezeTurns)/5.0, 1.0)
+		out[*idx+5] = math.Min(float64(p2Active.ToxicCounter)/15.0, 1.0)
+		out[*idx+7] = math.Min(float64(p2Active.TurnsActive)/20.0, 1.0)
+	}
+	*idx += ActiveProgressFeatures
+}
+
+func normalizeWeatherForVectorize(weather string) string {
+	switch gamedata.NormalizeID(weather) {
+	case "raindance", "primordialsea", "rain":
+		return "raindance"
+	case "sunnyday", "desolateland", "sun":
+		return "sunnyday"
+	case "sandstorm", "sand":
+		return "sandstorm"
+	case "hail", "snowscape", "snow":
+		return "snowscape"
+	default:
+		return ""
+	}
+}
+
+func normalizeTerrainForVectorize(terrain string) string {
+	switch gamedata.NormalizeID(terrain) {
+	case "electricterrain", "electric":
+		return "electricterrain"
+	case "grassyterrain", "grassy":
+		return "grassyterrain"
+	case "psychicterrain", "psychic":
+		return "psychicterrain"
+	case "mistyterrain", "misty":
+		return "mistyterrain"
+	default:
+		return ""
+	}
+}
+
+func boostMultiplier(stages int) float64 {
+	if stages >= 0 {
+		return float64(2+stages) / 2.0
+	}
+	return 2.0 / float64(2-stages)
+}
+
+func effectiveSpeedForOrder(state *simulator.BattleState, poke *simulator.PokemonState, side *simulator.SideConditions) float64 {
+	base := float64(poke.Stats.Spe)
+	if base <= 0 {
+		if entry := gamedata.LookupSpecies(poke.Species); entry != nil {
+			base = float64(entry.BaseStats.Spe*2 + 36)
+		} else {
+			base = 200.0
+		}
+	}
+	speed := base * boostMultiplier(poke.GetBoost(simulator.SpeShift))
+
+	if side != nil && side.TailwindTurns > 0 {
+		speed *= 2.0
+	}
+
+	item := gamedata.NormalizeID(poke.Item)
+	if item == "choicescarf" {
+		speed *= 1.5
+	}
+
+	ability := gamedata.NormalizeID(poke.Ability)
+	weather := ""
+	if state != nil {
+		weather = normalizeWeatherForVectorize(state.Field.Weather)
+	}
+	switch ability {
+	case "swiftswim":
+		if weather == "raindance" {
+			speed *= 2.0
+		}
+	case "chlorophyll":
+		if weather == "sunnyday" {
+			speed *= 2.0
+		}
+	case "sandrush":
+		if weather == "sandstorm" {
+			speed *= 2.0
+		}
+	case "slushrush":
+		if weather == "snowscape" {
+			speed *= 2.0
+		}
+	}
+
+	if poke.Status == "par" && ability != "quickfeet" {
+		speed *= 0.5
+	}
+	if ability == "quickfeet" && poke.Status != "" {
+		speed *= 1.5
+	}
+	return speed
+}
+
+func writeHashedOneHot(out []float64, offset int, buckets int, raw string) {
+	for i := 0; i < buckets; i++ {
+		out[offset+i] = 0.0
+	}
+	key := gamedata.NormalizeID(raw)
+	if key == "" || buckets <= 0 {
+		return
+	}
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	out[offset+int(h%uint32(buckets))] = 1.0
+}
+
+func secondaryEffectScore(move *gamedata.MoveEntry) float64 {
+	if move == nil {
+		return 0.0
+	}
+	score := 0.0
+	if move.Status != "" {
+		score += 0.2
+	}
+	if move.VolatileStatus != "" {
+		score += 0.2
+	}
+	if len(move.Boosts) > 0 || (move.Self != nil && len(move.Self.Boosts) > 0) || (move.SelfBoost != nil && len(move.SelfBoost.Boosts) > 0) {
+		score += 0.2
+	}
+	if move.Secondary != nil {
+		chance := math.Max(float64(move.Secondary.Chance), 10.0) / 100.0
+		score += 0.25 * math.Min(chance, 1.0)
+	}
+	if len(move.Secondaries) > 0 {
+		strongest := 0.0
+		for _, sec := range move.Secondaries {
+			chance := math.Max(float64(sec.Chance), 10.0) / 100.0
+			if chance > strongest {
+				strongest = chance
+			}
+		}
+		score += 0.25 * math.Min(strongest, 1.0)
+	}
+	if score > 1.0 {
+		score = 1.0
+	}
+	return score
+}
+
+func moveDisabledForActive(poke *simulator.PokemonState, moveName string, move *gamedata.MoveEntry, slot int) float64 {
+	if poke == nil || slot < 0 || slot >= 4 || moveName == "" || move == nil {
+		return 0.0
+	}
+	if poke.MovePP[slot] == 0 && poke.MoveMaxPP[slot] > 0 {
+		return 1.0
+	}
+	if (poke.Volatiles&simulator.VolatileTaunt) != 0 && move.Category == "Status" {
+		return 1.0
+	}
+	if (poke.Volatiles&simulator.VolatileEncore) != 0 && poke.LockedMove != "" && gamedata.NormalizeID(moveName) != gamedata.NormalizeID(poke.LockedMove) {
+		return 1.0
+	}
+	if simulator.IsAttackAction(simulator.ActionMove1+slot) && poke.LockedMove != "" {
+		if choice := gamedata.NormalizeID(poke.Item); choice == "choiceband" || choice == "choicespecs" || choice == "choicescarf" {
+			if gamedata.NormalizeID(moveName) != gamedata.NormalizeID(poke.LockedMove) {
+				return 1.0
+			}
+		}
+	}
+	return 0.0
+}
+
+// vectorizePlayerFeatures extracts 7 globals and 6*FeaturesPerSlot slot features.
+func vectorizePlayerFeatures(player *simulator.PlayerState, state *simulator.BattleState) ([PlayerGlobals]float64, [6 * FeaturesPerSlot]float64) {
+	var globals [PlayerGlobals]float64
 	var slots [6 * FeaturesPerSlot]float64
 	slotsIdx := 0
 	aliveCount := 0.0
@@ -545,6 +763,37 @@ func vectorizePlayerFeatures(player *simulator.PlayerState, state *simulator.Bat
 	globals[1] = totalHP / 6.0
 	if player.CanTerastallize {
 		globals[2] = 1.0
+	}
+	if player.TeamSize > 0 {
+		unknownAbilities := 0.0
+		unknownItems := 0.0
+		unknownMoves := 0.0
+		for i := 0; i < player.TeamSize; i++ {
+			mon := &player.Team[i]
+			if gamedata.NormalizeID(mon.Ability) == "" {
+				unknownAbilities++
+			}
+			if gamedata.NormalizeID(mon.Item) == "" {
+				unknownItems++
+			}
+			known := 0.0
+			for m := 0; m < 4; m++ {
+				if gamedata.NormalizeID(mon.Moves[m]) != "" {
+					known++
+				}
+			}
+			unknownMoves += 4.0 - known
+		}
+		invTeam := 1.0 / float64(player.TeamSize)
+		globals[3] = float64(6-player.TeamSize) / 6.0
+		globals[4] = unknownAbilities * invTeam
+		globals[5] = unknownItems * invTeam
+		globals[6] = unknownMoves / (4.0 * float64(player.TeamSize))
+	} else {
+		globals[3] = 1.0
+		globals[4] = 1.0
+		globals[5] = 1.0
+		globals[6] = 1.0
 	}
 
 	return globals, slots
@@ -618,43 +867,21 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 	slots[*slotsIdx] = float64(poke.NumMoves) / 4.0
 	*slotsIdx++
 
-	// Ability Flags (10)
-	abilityFlags := map[string]int{
-		"hugepower": 0, "purepower": 0, "rivalry": 1, "regenerator": 2, "intimidate": 3,
-		"levitate": 4, "drought": 5, "drizzle": 6, "sandstream": 7, "snowwarning": 8, "sturdy": 9,
-	}
-	aVec := make([]float64, 10)
-	if idx, ok := abilityFlags[poke.Ability]; ok {
-		aVec[idx] = 1.0
-	}
-	for i := 0; i < 10; i++ {
-		slots[*slotsIdx] = aVec[i]
-		*slotsIdx++
-	}
+	// Ability/Item identity with hashed one-hot buckets.
+	writeHashedOneHot(slots, *slotsIdx, AbilityHashBuckets, poke.Ability)
+	*slotsIdx += AbilityHashBuckets
+	writeHashedOneHot(slots, *slotsIdx, ItemHashBuckets, poke.Item)
+	*slotsIdx += ItemHashBuckets
 
-	// Item Flags (10)
-	itemFlags := map[string]int{
-		"choiceband": 0, "choicespecs": 1, "choicescarf": 2, "lifeorb": 3, "leftovers": 4,
-		"blacksludge": 4, "focussash": 5, "eviolite": 6, "assaultvest": 7, "heavydutyboots": 8, "rockyhelmet": 9,
-	}
-	iVec := make([]float64, 10)
-	if idx, ok := itemFlags[poke.Item]; ok {
-		iVec[idx] = 1.0
-	}
-	for i := 0; i < 10; i++ {
-		slots[*slotsIdx] = iVec[i]
-		*slotsIdx++
-	}
-
-	// Volatiles (1 bitpacked float)
-	vPacked := 0.0
-	for i := 0; i < 18; i++ {
+	// Volatiles as explicit binary features.
+	for i := 0; i < VolatileBits; i++ {
 		if (poke.Volatiles & (1 << uint32(i))) != 0 {
-			vPacked += math.Pow(2, float64(i))
+			slots[*slotsIdx] = 1.0
+		} else {
+			slots[*slotsIdx] = 0.0
 		}
+		*slotsIdx++
 	}
-	slots[*slotsIdx] = vPacked / 262144.0 // 2^18
-	*slotsIdx++
 
 	entry := gamedata.LookupSpecies(poke.Species)
 	if entry != nil {
@@ -761,19 +988,30 @@ func extractPokemon(poke *simulator.PokemonState, slots []float64, slotsIdx *int
 			slots[*slotsIdx] = eff
 			*slotsIdx++
 
-			// 6. Extra Padding for alignment
-			slots[*slotsIdx] = 0.0
+			ppRatio := 0.0
+			if poke.MoveMaxPP[m] > 0 {
+				ppRatio = math.Min(float64(poke.MovePP[m])/float64(poke.MoveMaxPP[m]), 1.0)
+			} else if move.PP > 0 {
+				ppRatio = 1.0
+			}
+			slots[*slotsIdx] = ppRatio
+			*slotsIdx++
+
+			slots[*slotsIdx] = moveDisabledForActive(poke, moveName, move, m)
+			*slotsIdx++
+
+			slots[*slotsIdx] = secondaryEffectScore(move)
 			*slotsIdx++
 		} else {
-			// Zero pad empty move slots (6 features)
-			for i := 0; i < 6; i++ {
+			// Zero pad empty move slots.
+			for i := 0; i < MoveFeatures; i++ {
 				slots[*slotsIdx] = 0.0
 				*slotsIdx++
 			}
 		}
 	}
 
-	// Final Padding to reach FeaturesPerSlot (80 total)
+	// Final Padding to reach FeaturesPerSlot.
 	expectedEnd := startOffset + FeaturesPerSlot
 	for *slotsIdx < expectedEnd {
 		slots[*slotsIdx] = 0.0

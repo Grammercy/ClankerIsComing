@@ -92,6 +92,8 @@ type PokemonState struct {
 	Terastallized      bool
 	Boosts             uint32    // atk, def, spa, spd, spe, eva, acc boosts (packed 4 bits each: 0-15, center is 6)
 	Moves              [4]string // move IDs (Showdown format, e.g. "thunderbolt")
+	MovePP             [4]int    // current PP per move slot
+	MoveMaxPP          [4]int    // max PP per move slot
 	NumMoves           int       // how many move slots are filled (0-4)
 
 	// Full details for Pokedex compliance
@@ -697,18 +699,8 @@ func ApplyEvent(state *BattleState, event parser.Event) {
 		if playerState.ActiveIdx != -1 {
 			active := &playerState.Team[playerState.ActiveIdx]
 			moveName := event.Value
-			// Add move to the pokemon's known moves if not already present
-			found := false
-			for i := 0; i < active.NumMoves; i++ {
-				if active.Moves[i] == moveName {
-					found = true
-					break
-				}
-			}
-			if !found && active.NumMoves < 4 {
-				active.Moves[active.NumMoves] = moveName
-				active.NumMoves++
-			}
+			moveSlot := ensureKnownMoveSlot(active, moveName)
+			consumeMovePP(active, moveSlot)
 		}
 	case "terastallize":
 		if playerState.ActiveIdx != -1 {
@@ -1009,6 +1001,49 @@ func onSwitchOut(p *PokemonState) {
 	}
 	p.ClearVolatiles()
 	p.LockedMove = ""
+}
+
+func defaultMovePP(moveName string) int {
+	move := gamedata.LookupMove(moveName)
+	if move == nil || move.PP <= 0 {
+		return 0
+	}
+	return move.PP
+}
+
+func ensureKnownMoveSlot(active *PokemonState, moveName string) int {
+	if active == nil || moveName == "" {
+		return -1
+	}
+	for i := 0; i < active.NumMoves; i++ {
+		if normalizedName(active.Moves[i]) == normalizedName(moveName) {
+			if active.MoveMaxPP[i] <= 0 {
+				active.MoveMaxPP[i] = defaultMovePP(active.Moves[i])
+			}
+			if active.MovePP[i] <= 0 && active.MoveMaxPP[i] > 0 {
+				active.MovePP[i] = active.MoveMaxPP[i]
+			}
+			return i
+		}
+	}
+	if active.NumMoves >= 4 {
+		return -1
+	}
+	slot := active.NumMoves
+	active.Moves[slot] = moveName
+	active.NumMoves++
+	active.MoveMaxPP[slot] = defaultMovePP(moveName)
+	active.MovePP[slot] = active.MoveMaxPP[slot]
+	return slot
+}
+
+func consumeMovePP(active *PokemonState, slot int) {
+	if active == nil || slot < 0 || slot >= 4 {
+		return
+	}
+	if active.MovePP[slot] > 0 {
+		active.MovePP[slot]--
+	}
 }
 
 func transformToForme(p *PokemonState, newSpecies string) {
@@ -1871,11 +1906,12 @@ func ExecuteSpecificTurn(state *BattleState, p1Action int, p2Action int) {
 		if attacker.Status == "frz" && moveThawsUser(attacker, moveIdx) {
 			clearStatus(attacker)
 		}
-		if !canActThisTurn(state, attacker) {
-			return
-		}
-		attacker.ActedThisTurn = true
-		_, defenderFlinched := applyMoveDamage(state, q.player, q.opponent, moveIdx)
+			if !canActThisTurn(state, attacker) {
+				return
+			}
+			attacker.ActedThisTurn = true
+			_, defenderFlinched := applyMoveDamage(state, q.player, q.opponent, moveIdx)
+			consumeMovePP(attacker, moveIdx)
 
 		// Check berries for both right after damage
 		checkBerries(state, q.player.GetActive())
