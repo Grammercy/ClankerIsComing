@@ -998,7 +998,6 @@ func TrainNetwork(replaysDir string, epochs int) error {
 	const patience = 3             // epochs without improvement before reducing LR
 	const lrDecay = 0.5            // multiply LR by this on plateau
 	const minLR = 1e-5             // floor to prevent vanishing updates
-	const exploratorySamplesPerEpoch int64 = 4000
 	numWorkers := runtime.NumCPU()
 	kernelBatchSize := tuneKernelBatchSize(mlp, attentionMLP)
 	trainingStart := time.Now()
@@ -1014,28 +1013,6 @@ func TrainNetwork(replaysDir string, epochs int) error {
 		if len(epochEntries) > maxPerEpoch {
 			epochEntries = epochEntries[:maxPerEpoch]
 		}
-		explorationPhase := learningRate > normalScheduleLR
-		explorationBudget := int64(0)
-		if explorationPhase {
-			explorationBudget = exploratorySamplesPerEpoch
-			fmt.Printf("  -> Exploration epoch sample budget: %d\n", explorationBudget)
-		}
-		var samplesQueued int64
-		reserveSample := func() bool {
-			if explorationBudget <= 0 {
-				return true
-			}
-			for {
-				cur := atomic.LoadInt64(&samplesQueued)
-				if cur >= explorationBudget {
-					return false
-				}
-				if atomic.CompareAndSwapInt64(&samplesQueued, cur, cur+1) {
-					return true
-				}
-			}
-		}
-
 		jobs := make(chan os.DirEntry, len(epochEntries))
 		samples := make(chan preparedSnapshot, kernelBatchSize*8)
 		statsCh := make(chan gpuEpochStats, 1)
@@ -1084,9 +1061,6 @@ func TrainNetwork(replaysDir string, epochs int) error {
 				defer parserWG.Done()
 				localStats := newReplayLabelStats()
 				for entry := range jobs {
-					if explorationBudget > 0 && atomic.LoadInt64(&samplesQueued) >= explorationBudget {
-						break
-					}
 					filePath := fmt.Sprintf("%s/%s", replaysDir, entry.Name())
 					eloWeight := 1.0
 					matchWinner := 0.5
@@ -1120,9 +1094,6 @@ func TrainNetwork(replaysDir string, epochs int) error {
 						atomic.AddInt64(&sampleBuildDurationNanos, int64(time.Since(buildStart)))
 						localStats.merge(replayStats)
 						for _, sample := range replaySamples {
-							if !reserveSample() {
-								break
-							}
 							sendStart := time.Now()
 							samples <- sample
 							atomic.AddInt64(&sampleSendWaitNanos, int64(time.Since(sendStart)))
