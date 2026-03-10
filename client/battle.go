@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/pokemon-engine/bot"
-	"github.com/pokemon-engine/evaluator"
 	"github.com/pokemon-engine/gamedata"
 	"github.com/pokemon-engine/simulator"
 )
@@ -270,9 +269,7 @@ func ChooseBestAction(req *ShowdownRequest, moveTime time.Duration, currentBattl
 	}
 
 	state := RequestToBattleState(req, currentBattleState)
-	mlpCache, attentionCache := evaluator.GetCaches()
-	tt := evaluator.NewTranspositionTable()
-	result := bot.IterativeDeepeningSearch(state, moveTime, mlpCache, attentionCache, tt)
+	result := bot.IterativeDeepeningSearch(state, moveTime)
 
 	return actionToShowdown(result.BestAction, req), result.BestAction, result
 }
@@ -301,15 +298,6 @@ func printPlayer(roomID, label string, p *simulator.PlayerState) {
 		log.Printf("[%s]   [%d] %s %d/%d %s %s Volatiles=%0x",
 			roomID, i, poke.Species, poke.HP, poke.MaxHP, activeStr, faintStr, poke.Volatiles)
 	}
-}
-
-// VectorizeRequest computes the feature vector for RL experience recording
-func VectorizeRequest(req *ShowdownRequest, currentBattleState *simulator.BattleState) [evaluator.TotalFeatures]float64 {
-	state := RequestToBattleState(req, currentBattleState)
-	var features [evaluator.TotalFeatures]float64
-	attentionCache := evaluator.NewInferenceCache(evaluator.GlobalAttentionMLP)
-	evaluator.Vectorize(state, evaluator.GlobalAttentionMLP, &features, attentionCache)
-	return features
 }
 
 // actionToShowdown converts our internal action index to Showdown's /choose format

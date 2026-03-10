@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -24,10 +23,8 @@ import (
 	"github.com/pokemon-engine/simulator"
 )
 
-const latentTagEvalRepeats = 5
-
 func main() {
-	cmd := flag.String("cmd", "", "Command to run: 'scrape', 'parse', 'actions', 'verify-actions', 'evaluate', 'bulk-evaluate', 'train', 'train-tagged', 'mixed-train', 'selfplay', 'search-evaluate', 'tag', 'import', 'live'")
+	cmd := flag.String("cmd", "", "Command to run: 'scrape', 'parse', 'actions', 'verify-actions', 'evaluate', 'bulk-evaluate', 'search-evaluate', 'import', 'live'")
 	format := flag.String("format", "gen9randombattle", "Pokemon Showdown format to scrape")
 	numGames := flag.Int("num", 100, "Number of games to scrape")
 	outDir := flag.String("out", "data/replays", "Output directory for scraped replays")
@@ -37,18 +34,8 @@ func main() {
 	file := flag.String("file", "", "Path to a specific replay log to run actions command against")
 	turn := flag.Int("turn", 1, "Target turn number to simulate up to")
 	player := flag.String("player", "p1", "Player ID to generate actions for (e.g. 'p1' or 'p2')")
-	// Train command flags
-	epochs := flag.Int("epochs", 10, "Number of training iterations over the dataset")
 	depth := flag.Int("depth", 2, "Search depth for Alpha-Beta engine (search-evaluate command)")
 	sims := flag.Int("sims", 0, "MCTS simulation count (0 = use depth-based default)")
-	taggedDir := flag.String("tagged", "data/tagged", "Directory for tagged data output/input (tag/train-tagged commands)")
-	testDir := flag.String("test", "data/test", "Directory containing held-out replay logs for validation")
-	mixSearchRatio := flag.Float64("mix-search-ratio", 0.3, "Fraction of positions labeled with search in mixed-train mode")
-	mixBaseSims := flag.Int("mix-base-sims", 256, "Baseline MCTS simulations per search-labeled position in mixed-train mode (0 = depth default)")
-	mixHardSims := flag.Int("mix-hard-sims", 1536, "High-budget MCTS simulations for hard positions in mixed-train mode (0 = disable hard re-tag)")
-	mixHardRatio := flag.Float64("mix-hard-ratio", 0.15, "Sampling ratio for late-game hard re-tagging in mixed-train mode")
-	mixHardMargin := flag.Float64("mix-hard-margin", 0.03, "Top-1 minus top-2 score margin threshold for uncertainty-triggered hard re-tagging")
-	mixHardDepth := flag.Int("mix-hard-depth", 0, "Search depth for hard re-tagging (0 = depth+1)")
 	moveTimeMs := flag.Int("move-time-ms", int(client.SearchMoveTime/time.Millisecond), "Per-move time budget in milliseconds (live command)")
 	url := flag.String("url", "", "Pokemon Showdown replay URL for import command")
 	// Live bot flags
@@ -66,12 +53,7 @@ func main() {
 		fmt.Println("  verify-actions   Bulk verify simulator action generation against replays")
 		fmt.Println("  evaluate         Predict win probability for a specific game state")
 		fmt.Println("  bulk-evaluate    Run win probability prediction on a large set of replays")
-		fmt.Println("  train            Train the AI neural network on processed replay data")
-		fmt.Println("  selfplay         Generate synthetic training matches by pitting the AI against itself")
 		fmt.Println("  search-evaluate  Run search-enhanced evaluation (Alpha-Beta) on replays")
-		fmt.Println("  tag              Tag every replay decision position using search and write to tagged JSON")
-		fmt.Println("  train-tagged     Train the network using only pre-tagged JSON data")
-		fmt.Println("  mixed-train      Generate mixed labels (depth-0 + search) and train with test-set validation")
 		fmt.Println("  import           Download, parse, and analyze a specific Showdown replay URL")
 		fmt.Println("  live             Run the bot live on Pokemon Showdown (accepts random battles)")
 		fmt.Println("")
@@ -135,36 +117,6 @@ func main() {
 			fmt.Printf("Bulk Evaluation failed: %v\n", err)
 			os.Exit(1)
 		}
-	case "train":
-		err := evaluator.TrainNetwork(*inDir, *epochs)
-		if err != nil {
-			fmt.Printf("Neural network training failed: %v\n", err)
-			os.Exit(1)
-		}
-	case "train-tagged":
-		err := evaluator.TrainNetworkFromTaggedWithValidation(*taggedDir, *testDir, *epochs)
-		if err != nil {
-			fmt.Printf("Tagged-data training failed: %v\n", err)
-			os.Exit(1)
-		}
-	case "mixed-train":
-		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
-			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
-		}
-		err := runMixedTrainCommand(*inDir, *taggedDir, *testDir, *depth, *mixSearchRatio, *mixBaseSims, *mixHardSims, *mixHardRatio, *mixHardMargin, *mixHardDepth, *epochs)
-		if err != nil {
-			fmt.Printf("Mixed training failed: %v\n", err)
-			os.Exit(1)
-		}
-	case "selfplay":
-		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
-			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
-		}
-		err := bot.RunSelfPlayPipeline(*numGames, *depth, *outDir)
-		if err != nil {
-			fmt.Printf("Self-play generation failed: %v\n", err)
-			os.Exit(1)
-		}
 	case "search-evaluate":
 		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
 			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
@@ -172,15 +124,6 @@ func main() {
 		err := runSearchEvaluateBulkCommand(*inDir, *turn, *depth, *sims)
 		if err != nil {
 			fmt.Printf("Search evaluation failed: %v\n", err)
-			os.Exit(1)
-		}
-	case "tag":
-		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
-			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
-		}
-		err := runTagReplaysCommand(*inDir, *taggedDir, *depth)
-		if err != nil {
-			fmt.Printf("Replay tagging failed: %v\n", err)
 			os.Exit(1)
 		}
 	case "import":
@@ -212,30 +155,6 @@ func main() {
 		fmt.Printf("Unknown command: %s\n", *cmd)
 		os.Exit(1)
 	}
-}
-
-func randomLatentTokens(rng *rand.Rand) (float64, float64) {
-	return rng.Float64()*2.0 - 1.0, rng.Float64()*2.0 - 1.0
-}
-
-func averageDetailedTagsWithLatents(state *simulator.BattleState, depth int, sims int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, rng *rand.Rand) ([simulator.MaxActions]float64, float64, float64) {
-	var acc [simulator.MaxActions]float64
-	reasoningTokenMean := 0.0
-	predictionTokenMean := 0.0
-	for i := 0; i < latentTagEvalRepeats; i++ {
-		latentReasoningToken, latentPredictionToken := randomLatentTokens(rng)
-		reasoningTokenMean += latentReasoningToken
-		predictionTokenMean += latentPredictionToken
-		tags := bot.GetDetailedTagsWithBudgetAndLatents(state, depth, sims, mlpCache, attentionCache, tt, latentReasoningToken, latentPredictionToken)
-		for action := 0; action < simulator.MaxActions; action++ {
-			acc[action] += tags[action]
-		}
-	}
-	inv := 1.0 / float64(latentTagEvalRepeats)
-	for action := 0; action < simulator.MaxActions; action++ {
-		acc[action] *= inv
-	}
-	return acc, reasoningTokenMean * inv, predictionTokenMean * inv
 }
 
 func runParseCommand(inDir string) error {
@@ -464,8 +383,7 @@ func runEvaluateCommand(filePath string, targetTurn int) error {
 		return fmt.Errorf("failed to simulate state: %w", err)
 	}
 
-	mlpCache, attentionCache := evaluator.GetCaches()
-	winProb := evaluator.Evaluate(state, -1, evaluator.GlobalMLP, evaluator.GlobalAttentionMLP, mlpCache, attentionCache, nil)
+	winProb := evaluator.EvaluateState(state)
 
 	fmt.Printf("\n--- Evaluation at Turn %d ---\n", targetTurn)
 	fmt.Printf("Player 1 (%s) vs Player 2 (%s)\n", replay.P1, replay.P2)
@@ -521,8 +439,6 @@ func runEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int, sims 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			mlpCache, attentionCache := evaluator.GetCaches()
-			tt := evaluator.NewTranspositionTable()
 			for filePath := range jobs {
 				replay, err := parser.ParseLogFile(filePath)
 				if err != nil {
@@ -552,7 +468,7 @@ func runEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int, sims 
 				tf := atomic.AddInt32(&totalFiles, 1)
 
 				// Use SearchEvaluate with specified depth and sims
-				winProb, nodes := bot.SearchEvaluateWithSims(state, searchDepth, sims, mlpCache, attentionCache, tt)
+				winProb, nodes := bot.SearchEvaluateWithSims(state, searchDepth, sims)
 				atomic.AddInt64(&totalNodes, int64(nodes))
 
 				actualWinner := "tie"
@@ -743,8 +659,6 @@ func runSearchEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			mlpCache, attentionCache := evaluator.GetCaches()
-			tt := evaluator.NewTranspositionTable()
 			for filePath := range jobs {
 				replay, err := parser.ParseLogFile(filePath)
 				if err != nil {
@@ -769,7 +683,7 @@ func runSearchEvaluateBulkCommand(inDir string, targetTurn int, searchDepth int,
 				tf := atomic.AddInt32(&totalFiles, 1)
 
 				// Use SearchEvaluate with specified depth and sims
-				winProb, nodes := bot.SearchEvaluateWithSims(state, searchDepth, sims, mlpCache, attentionCache, tt)
+				winProb, nodes := bot.SearchEvaluateWithSims(state, searchDepth, sims)
 				atomic.AddInt64(&totalNodes, int64(nodes))
 
 				actualWinner := "tie"
@@ -958,398 +872,6 @@ func mapReplayEventChosenAction(replay *parser.Replay, state *simulator.BattleSt
 	}
 }
 
-func runMixedTrainCommand(inDir string, taggedDir string, testDir string, searchDepth int, searchRatio float64, baseSims int, hardSims int, hardRatio float64, hardMargin float64, hardDepth int, epochs int) error {
-	if searchDepth < 0 {
-		return fmt.Errorf("depth must be >= 0")
-	}
-	if searchRatio < 0.0 || searchRatio > 1.0 {
-		return fmt.Errorf("mix-search-ratio must be between 0 and 1")
-	}
-	if baseSims < 0 {
-		return fmt.Errorf("mix-base-sims must be >= 0")
-	}
-	if hardSims < 0 {
-		return fmt.Errorf("mix-hard-sims must be >= 0")
-	}
-	if hardRatio < 0.0 || hardRatio > 1.0 {
-		return fmt.Errorf("mix-hard-ratio must be between 0 and 1")
-	}
-	if hardMargin < 0.0 {
-		return fmt.Errorf("mix-hard-margin must be >= 0")
-	}
-	if hardDepth < 0 {
-		return fmt.Errorf("mix-hard-depth must be >= 0")
-	}
-	if err := os.MkdirAll(taggedDir, 0755); err != nil {
-		return fmt.Errorf("failed to create tagged output directory: %w", err)
-	}
-
-	entries, err := os.ReadDir(inDir)
-	if err != nil {
-		return fmt.Errorf("could not read replay directory: %w", err)
-	}
-	totalLogFiles := 0
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".log") {
-			totalLogFiles++
-		}
-	}
-
-	replayCount := 0
-	processedLogs := 0
-	taggedCount := 0
-	totalPositions := 0
-	skippedPositions := 0
-	searchLabels := 0
-	hardRetags := 0
-	hardRetagsUncertain := 0
-	hardRetagsLateGame := 0
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	start := time.Now()
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
-			continue
-		}
-		processedLogs++
-
-		filePath := fmt.Sprintf("%s/%s", inDir, entry.Name())
-		replay, err := parser.ParseLogFile(filePath)
-		if err != nil {
-			elapsed := time.Since(start)
-			avgPerLog := elapsed / time.Duration(processedLogs)
-			remaining := avgPerLog * time.Duration(totalLogFiles-processedLogs)
-			fmt.Printf("Skipping %s (parse error): %v [Progress %d/%d | Elapsed %s | ETA %s]\n",
-				entry.Name(), err, processedLogs, totalLogFiles, formatDurationCompact(elapsed), formatDurationCompact(remaining))
-			continue
-		}
-		replayCount++
-
-		avgRating := float64(replay.P1Rating+replay.P2Rating) / 2.0
-		if avgRating < 750.0 {
-			avgRating = 750.0
-		}
-		eloWeight := avgRating / 1500.0
-
-		indices := collectReplayDecisionEventIndices(replay)
-		mlpCache, attentionCache := evaluator.GetCaches()
-		tt := evaluator.NewTranspositionTable()
-		taggedSamples := make([]evaluator.TaggedSample, 0, len(indices))
-
-		if len(indices) == 0 {
-			continue
-		}
-		state, err := simulator.FastForwardToEvent(replay, indices[0]-1)
-		if err != nil {
-			skippedPositions += len(indices)
-			continue
-		}
-		lastEventIdx := indices[0] - 1
-
-		for _, eventIdx := range indices {
-			for i := lastEventIdx + 1; i < eventIdx; i++ {
-				simulator.ApplyEvent(state, replay.Events[i])
-			}
-			simulator.UpdateRNGState(state, replay, eventIdx-1)
-			lastEventIdx = eventIdx - 1
-
-			validActions, validLen := simulator.GetSearchActions(&state.P1)
-			if validLen == 0 {
-				skippedPositions++
-				continue
-			}
-
-			targets := make([]float64, simulator.MaxActions)
-			for i := 0; i < simulator.MaxActions; i++ {
-				targets[i] = -1.0
-			}
-			latentReasoningToken, latentPredictionToken := randomLatentTokens(rng)
-
-			isSearchTag := rng.Float64() < searchRatio
-			if !isSearchTag && replay.Events[eventIdx].Turn <= 10 {
-				skippedPositions++
-				continue
-			}
-
-			if isSearchTag {
-				detailedTags, meanReasoning, meanPrediction := averageDetailedTagsWithLatents(state, searchDepth, baseSims, mlpCache, attentionCache, tt, rng)
-				latentReasoningToken = meanReasoning
-				latentPredictionToken = meanPrediction
-				_, margin := topTwoSearchScores(validActions, validLen, detailedTags)
-				isUncertain := margin <= hardMargin
-				isLateGame := totalAliveInState(state) <= 4
-				retagByLateGame := isLateGame && hardRatio > 0 && rng.Float64() < hardRatio
-				shouldHardRetag := hardSims > 0 && (isUncertain || retagByLateGame)
-				if shouldHardRetag {
-					retagDepth := hardDepth
-					if retagDepth == 0 {
-						retagDepth = searchDepth + 1
-					}
-					detailedTags, meanReasoning, meanPrediction = averageDetailedTagsWithLatents(state, retagDepth, hardSims, mlpCache, attentionCache, tt, rng)
-					latentReasoningToken = meanReasoning
-					latentPredictionToken = meanPrediction
-					hardRetags++
-					if isUncertain {
-						hardRetagsUncertain++
-					}
-					if retagByLateGame {
-						hardRetagsLateGame++
-					}
-				}
-				for i := 0; i < validLen; i++ {
-					action := validActions[i]
-					if action >= 0 && action < simulator.MaxActions {
-						targets[action] = detailedTags[action]
-					}
-				}
-				searchLabels++
-			} else {
-				// Replay label (non-tagged)
-				matchWinner := 0.5
-				if strings.EqualFold(replay.Winner, replay.P1) {
-					matchWinner = 1.0
-				} else if strings.EqualFold(replay.Winner, replay.P2) {
-					matchWinner = 0.0
-				}
-				chosenAction, ok := mapReplayEventChosenAction(replay, state, eventIdx)
-				if !ok || chosenAction < 0 || chosenAction >= simulator.MaxActions {
-					skippedPositions++
-					continue
-				}
-				targets[chosenAction] = matchWinner
-			}
-
-			tagged, _, ok := evaluator.BuildTaggedSampleFromStateWithLatents(state, targets, eloWeight, isSearchTag, latentReasoningToken, latentPredictionToken)
-			if !ok {
-				skippedPositions++
-				continue
-			}
-			tagged.Turn = replay.Events[eventIdx].Turn
-			tagged.EventIdx = eventIdx
-			taggedSamples = append(taggedSamples, tagged)
-		}
-
-		dataset := evaluator.TaggedReplayDataset{
-			Version:      evaluator.TaggedReplayVersion,
-			SourceReplay: entry.Name(),
-			Depth:        searchDepth,
-			Samples:      taggedSamples,
-		}
-		data, err := json.Marshal(dataset)
-		if err != nil {
-			return fmt.Errorf("failed to serialize mixed-tagged replay %s: %w", entry.Name(), err)
-		}
-
-		baseName := strings.TrimSuffix(entry.Name(), ".log")
-		outPath := path.Join(taggedDir, baseName+".mixed.tagged.json")
-		if err := os.WriteFile(outPath, data, 0644); err != nil {
-			return fmt.Errorf("failed to write mixed-tagged replay %s: %w", outPath, err)
-		}
-
-		taggedCount++
-		totalPositions += len(taggedSamples)
-		if processedLogs%100 == 0 || processedLogs == totalLogFiles {
-			elapsed := time.Since(start)
-			avgPerLog := elapsed / time.Duration(processedLogs)
-			remaining := avgPerLog * time.Duration(totalLogFiles-processedLogs)
-			fmt.Printf("\rMixed-tagging Progress: %d/%d logs | %d positions | Elapsed %s | ETA %s",
-				processedLogs, totalLogFiles, totalPositions, formatDurationCompact(elapsed), formatDurationCompact(remaining))
-		}
-	}
-	fmt.Println()
-
-	fmt.Printf("Mixed label generation complete: %d/%d replays written, %d positions tagged, %d positions skipped\n", taggedCount, replayCount, totalPositions, skippedPositions)
-	fmt.Printf("Label counts: search=%d (sampled ratio realized: %.2f%%)\n", searchLabels, 100.0*float64(searchLabels)/math.Max(1.0, float64(searchLabels+skippedPositions)))
-	if searchLabels > 0 {
-		fmt.Printf("Hard re-tag stats: total=%d uncertain=%d late_game=%d (%.2f%% of search labels)\n",
-			hardRetags, hardRetagsUncertain, hardRetagsLateGame, 100.0*float64(hardRetags)/float64(searchLabels))
-	}
-	fmt.Printf("Starting tagged training with validation on test set: %s\n", testDir)
-	return evaluator.TrainNetworkFromTaggedWithValidation(taggedDir, testDir, epochs)
-}
-
-func topTwoSearchScores(validActions [simulator.MaxActions]int, validLen int, tags [simulator.MaxActions]float64) (float64, float64) {
-	if validLen <= 0 {
-		return 0.5, 0.0
-	}
-	best := -math.MaxFloat64
-	second := -math.MaxFloat64
-	for i := 0; i < validLen; i++ {
-		action := validActions[i]
-		if action < 0 || action >= simulator.MaxActions {
-			continue
-		}
-		score := tags[action]
-		if score > best {
-			second = best
-			best = score
-		} else if score > second {
-			second = score
-		}
-	}
-	if best == -math.MaxFloat64 {
-		return 0.5, 0.0
-	}
-	if second == -math.MaxFloat64 {
-		second = best
-	}
-	return best, best - second
-}
-
-func totalAliveInState(state *simulator.BattleState) int {
-	if state == nil {
-		return 0
-	}
-	return countAlivePlayer(&state.P1) + countAlivePlayer(&state.P2)
-}
-
-func countAlivePlayer(player *simulator.PlayerState) int {
-	count := 0
-	for i := 0; i < player.TeamSize; i++ {
-		if !player.Team[i].Fainted {
-			count++
-		}
-	}
-	return count
-}
-
-func formatDurationCompact(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	if h > 0 {
-		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
-	}
-	if m > 0 {
-		return fmt.Sprintf("%dm%02ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
-}
-
-func runTagReplaysCommand(inDir string, taggedDir string, searchDepth int) error {
-	if searchDepth < 0 {
-		return fmt.Errorf("depth must be >= 0")
-	}
-	if err := os.MkdirAll(taggedDir, 0755); err != nil {
-		return fmt.Errorf("failed to create tagged output directory: %w", err)
-	}
-
-	entries, err := os.ReadDir(inDir)
-	if err != nil {
-		return fmt.Errorf("could not read replay directory: %w", err)
-	}
-
-	replayCount := 0
-	taggedCount := 0
-	totalPositions := 0
-	skippedPositions := 0
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
-			continue
-		}
-
-		filePath := fmt.Sprintf("%s/%s", inDir, entry.Name())
-		replay, err := parser.ParseLogFile(filePath)
-		if err != nil {
-			fmt.Printf("Skipping %s (parse error): %v\n", entry.Name(), err)
-			continue
-		}
-		replayCount++
-
-		avgRating := float64(replay.P1Rating+replay.P2Rating) / 2.0
-		if avgRating < 750.0 {
-			avgRating = 750.0
-		}
-		eloWeight := avgRating / 1500.0
-
-		indices := collectReplayDecisionEventIndices(replay)
-		mlpCache, attentionCache := evaluator.GetCaches()
-		tt := evaluator.NewTranspositionTable()
-		taggedSamples := make([]evaluator.TaggedSample, 0, len(indices))
-
-		if len(indices) == 0 {
-			continue
-		}
-		state, err := simulator.FastForwardToEvent(replay, indices[0]-1)
-		if err != nil {
-			skippedPositions += len(indices)
-			continue
-		}
-		lastEventIdx := indices[0] - 1
-
-		for _, eventIdx := range indices {
-			for i := lastEventIdx + 1; i < eventIdx; i++ {
-				simulator.ApplyEvent(state, replay.Events[i])
-			}
-			simulator.UpdateRNGState(state, replay, eventIdx-1)
-			lastEventIdx = eventIdx - 1
-
-			validActions, validLen := simulator.GetSearchActions(&state.P1)
-			if validLen == 0 {
-				skippedPositions++
-				continue
-			}
-
-			detailedTags, meanReasoning, meanPrediction := averageDetailedTagsWithLatents(state, searchDepth, 0, mlpCache, attentionCache, tt, rng)
-			targets := make([]float64, simulator.MaxActions)
-			for i := 0; i < simulator.MaxActions; i++ {
-				targets[i] = -1.0
-			}
-			for i := 0; i < validLen; i++ {
-				action := validActions[i]
-				if action >= 0 && action < simulator.MaxActions {
-					targets[action] = detailedTags[action]
-				}
-			}
-
-			tagged, _, ok := evaluator.BuildTaggedSampleFromStateWithLatents(state, targets, eloWeight, true, meanReasoning, meanPrediction)
-			if !ok {
-				skippedPositions++
-				continue
-			}
-			tagged.Turn = replay.Events[eventIdx].Turn
-			tagged.EventIdx = eventIdx
-			taggedSamples = append(taggedSamples, tagged)
-		}
-
-		dataset := evaluator.TaggedReplayDataset{
-			Version:      evaluator.TaggedReplayVersion,
-			SourceReplay: entry.Name(),
-			Depth:        searchDepth,
-			Samples:      taggedSamples,
-		}
-		data, err := json.Marshal(dataset)
-		if err != nil {
-			return fmt.Errorf("failed to serialize tagged replay %s: %w", entry.Name(), err)
-		}
-
-		baseName := strings.TrimSuffix(entry.Name(), ".log")
-		outPath := path.Join(taggedDir, baseName+".tagged.json")
-		if err := os.WriteFile(outPath, data, 0644); err != nil {
-			return fmt.Errorf("failed to write tagged replay %s: %w", outPath, err)
-		}
-
-		taggedCount++
-		totalPositions += len(taggedSamples)
-		if taggedCount%10 == 0 {
-			fmt.Printf("\rTagged %d replays (%d positions)...", taggedCount, totalPositions)
-		}
-	}
-	fmt.Println()
-
-	fmt.Printf("Tagging complete: %d/%d replays written, %d positions tagged, %d positions skipped\n",
-		taggedCount, replayCount, totalPositions, skippedPositions)
-	return nil
-}
-
 func runImportCommand(rawURL string) error {
 	// Normalize URL: strip trailing slash, extract replay ID
 	rawURL = strings.TrimRight(rawURL, "/")
@@ -1419,10 +941,6 @@ func runImportCommand(rawURL string) error {
 	fmt.Printf("\n--- Turn-by-Turn Win Probability (P1: %s) ---\n", replay.P1)
 	fmt.Printf("%-6s  %-8s  %-40s\n", "Turn", "P1 Win%", "Bar")
 	fmt.Println(strings.Repeat("-", 58))
-
-	mlpCache, attentionCache := evaluator.GetCaches()
-	tt := evaluator.NewTranspositionTable()
-
 	var history []float64
 	for t := 1; t <= replay.Turns; t++ {
 		state, err := simulator.FastForward(replay, t)
@@ -1430,7 +948,7 @@ func runImportCommand(rawURL string) error {
 			continue
 		}
 
-		winProb, _ := bot.SearchEvaluate(state, 3, mlpCache, attentionCache, tt)
+		winProb, _ := bot.SearchEvaluate(state, 3)
 		history = append(history, winProb)
 
 		// Draw a visual bar
