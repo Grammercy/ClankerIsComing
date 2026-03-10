@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/pokemon-engine/evaluator"
 	"github.com/pokemon-engine/simulator"
 )
 
@@ -29,8 +28,8 @@ type ShowdownActive struct {
 // (bool in some payloads, string in others such as a Tera type).
 func (a *ShowdownActive) UnmarshalJSON(data []byte) error {
 	type showdownActiveAlias struct {
-		Moves           []ShowdownMove   `json:"moves"`
-		CanTerastallize json.RawMessage  `json:"canTerastallize"`
+		Moves           []ShowdownMove  `json:"moves"`
+		CanTerastallize json.RawMessage `json:"canTerastallize"`
 	}
 
 	var raw showdownActiveAlias
@@ -108,21 +107,12 @@ type ShowdownRequest struct {
 	TeamPreview bool             // Set manually when we detect team preview
 }
 
-// Experience records a single decision point for reinforcement learning
-type Experience struct {
-	Features [evaluator.TotalFeatures]float64
-	Action   int // The action that was chosen (0=attack, 1-5=switch)
-}
-
 // BattleContext holds the live state for one active battle
 type BattleContext struct {
-	RoomID              string
-	PlayerID            string // "p1" or "p2"
-	OpponentID          string // the other player
-	Request             *ShowdownRequest
-	State               *simulator.BattleState
-	IsOver              bool
-	Experiences         []Experience                      // Our decisions for post-game learning
-	OpponentExperiences []Experience                      // Opponent's observed decisions (learned on loss)
-	LastFeatures        *[evaluator.TotalFeatures]float64 // State snapshot for pairing with opponent actions
+	RoomID     string
+	PlayerID   string // "p1" or "p2"
+	OpponentID string // the other player
+	Request    *ShowdownRequest
+	State      *simulator.BattleState
+	IsOver     bool
 }

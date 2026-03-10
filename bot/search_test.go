@@ -3,7 +3,6 @@ package bot
 import (
 	"testing"
 
-	"github.com/pokemon-engine/evaluator"
 	"github.com/pokemon-engine/simulator"
 )
 
@@ -28,12 +27,8 @@ func TestMCTSSearch(t *testing.T) {
 	state.P1.Team[0].IsActive = true
 	state.P2.Team[0].IsActive = true
 
-	// Mock evaluator to avoid OpenCL dependency
-	evaluator.GlobalMLP = nil
-
-	// Run MCTS search
-	// We expect it to fallback to baseEval (0.5) if MLP is nil, but still run simulations
-	result := SearchBestMoveWithSims(state, 1, 10, nil, nil, nil)
+	// Run MCTS search with deterministic non-ML evaluator.
+	result := SearchBestMoveWithSims(state, 1, 10)
 
 	if result.NodesSearched == 0 {
 		t.Errorf("Expected some nodes to be searched, got 0")

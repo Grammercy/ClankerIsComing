@@ -12,7 +12,6 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/pokemon-engine/bot"
-	"github.com/pokemon-engine/evaluator"
 	"github.com/pokemon-engine/gamedata"
 	"github.com/pokemon-engine/simulator"
 )
@@ -40,8 +39,6 @@ func RunBot(username, password string, moveTime time.Duration) error {
 	if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
 		log.Printf("Warning: Movedex not loaded: %v", err)
 	}
-	evaluator.InitEvaluator()
-
 	bot := &ShowdownBot{
 		username: username,
 		password: password,
@@ -698,7 +695,6 @@ func (b *ShowdownBot) onRequest(roomID, data string) {
 	// Update context state with the latest synced version
 	ctx.State = state
 	DebugPrintState(roomID, state)
-	logAttentionWeights(roomID, state)
 
 	choice, actionIdx, searchResult := ChooseBestAction(&req, b.moveTime, ctx.State)
 	if choice == "" {
@@ -829,76 +825,4 @@ func (b *ShowdownBot) send(roomID, message string) {
 	if err := b.conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
 		log.Printf("Send error: %v", err)
 	}
-}
-
-func logAttentionWeights(roomID string, state *simulator.BattleState) {
-	_, attentionCache := evaluator.GetCaches()
-	weights, ok := evaluator.AttentionWeights(state, attentionCache)
-	if !ok {
-		return
-	}
-
-	p1Labels := attentionSlotLabels(&state.P1)
-	p2Labels := attentionSlotLabels(&state.P2)
-	log.Printf("[%s] --- Attention Weights ---", roomID)
-	for i := 0; i < 6; i++ {
-		if p1Labels[i] == "None" {
-			continue
-		}
-		log.Printf("[%s]   P1 %-24s : %.4f", roomID, p1Labels[i], weights[i])
-	}
-	for i := 0; i < 6; i++ {
-		if p2Labels[i] == "None" {
-			continue
-		}
-		log.Printf("[%s]   P2 %-24s : %.4f", roomID, p2Labels[i], weights[6+i])
-	}
-}
-
-func attentionSlotLabels(player *simulator.PlayerState) [6]string {
-	var labels [6]string
-	idx := 0
-
-	active := player.GetActive()
-	if active != nil {
-		labels[idx] = formatAttentionPokemonLabel(active)
-		idx++
-	}
-
-	remaining := make([]*simulator.PokemonState, 0, player.TeamSize)
-	for i := 0; i < player.TeamSize; i++ {
-		poke := &player.Team[i]
-		if poke.IsActive {
-			continue
-		}
-		remaining = append(remaining, poke)
-	}
-	sort.Slice(remaining, func(i, j int) bool {
-		return remaining[i].Species < remaining[j].Species
-	})
-
-	for _, poke := range remaining {
-		if idx >= 6 {
-			break
-		}
-		labels[idx] = formatAttentionPokemonLabel(poke)
-		idx++
-	}
-
-	for idx < 6 {
-		labels[idx] = "None"
-		idx++
-	}
-	return labels
-}
-
-func formatAttentionPokemonLabel(poke *simulator.PokemonState) string {
-	if poke == nil || poke.Species == "" {
-		return "Unknown"
-	}
-	label := poke.Species
-	if poke.Fainted {
-		label += " (fnt)"
-	}
-	return label
 }

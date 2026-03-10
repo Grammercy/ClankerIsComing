@@ -1,4 +1,2 @@
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
-github.com/jgillich/go-opencl v0.0.0-20180608191952-a0efba3e5257 h1:CBOaGRHrueOBsM7vclAiWv4aecXkEAjGfYPGPgM9AdU=
-github.com/jgillich/go-opencl v0.0.0-20180608191952-a0efba3e5257/go.mod h1:zVb9psSAj+VpRI2Kp8J9sG437/VkNvl+l3dBMAUmGi4=

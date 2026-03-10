@@ -2,78 +2,45 @@ package evaluator
 
 import (
 	"testing"
+
+	"github.com/pokemon-engine/simulator"
 )
 
-func TestHashFeatures(t *testing.T) {
-	t.Run("Determinism", func(t *testing.T) {
-		var f1, f2 [TotalFeatures]float64
-		for i := 0; i < TotalFeatures; i++ {
-			f1[i] = float64(i) * 0.1
-			f2[i] = float64(i) * 0.1
-		}
+func TestEvaluateStateTerminal(t *testing.T) {
+	state := &simulator.BattleState{}
+	state.P1.TeamSize = 1
+	state.P2.TeamSize = 1
+	state.P1.Team[0] = simulator.PokemonState{Fainted: false}
+	state.P2.Team[0] = simulator.PokemonState{Fainted: false}
 
-		h1 := HashFeatures(&f1)
-		h2 := HashFeatures(&f2)
+	if got := EvaluateState(state); got != 0.5 {
+		t.Fatalf("expected neutral score for non-terminal state, got %v", got)
+	}
 
-		if h1 != h2 {
-			t.Errorf("Expected identical hashes for identical inputs, got %d and %d", h1, h2)
-		}
-	})
+	state.P2.Team[0].Fainted = true
+	if got := EvaluateState(state); got != 1.0 {
+		t.Fatalf("expected win score for P1 terminal state, got %v", got)
+	}
 
-	t.Run("Difference", func(t *testing.T) {
-		var f1, f2 [TotalFeatures]float64
-		for i := 0; i < TotalFeatures; i++ {
-			f1[i] = float64(i) * 0.1
-			f2[i] = float64(i) * 0.1
-		}
+	state.P1.Team[0].Fainted = true
+	if got := EvaluateState(state); got != 0.5 {
+		t.Fatalf("expected draw score when both are fainted, got %v", got)
+	}
+}
 
-		// Change a single element
-		f2[0] = 1.0
+func TestEvaluateBatchStates(t *testing.T) {
+	states := []simulator.BattleState{{}, {}}
+	states[0].P1.TeamSize = 1
+	states[0].P2.TeamSize = 1
+	states[1].P1.TeamSize = 1
+	states[1].P2.TeamSize = 1
+	states[1].P2.Team[0].Fainted = true
 
-		h1 := HashFeatures(&f1)
-		h2 := HashFeatures(&f2)
-
-		if h1 == h2 {
-			t.Errorf("Expected different hashes for different inputs, got %d", h1)
-		}
-	})
-
-	t.Run("ZeroVsNonZero", func(t *testing.T) {
-		var f1, f2 [TotalFeatures]float64
-		// f1 is all zeros
-		for i := 0; i < TotalFeatures; i++ {
-			f2[i] = 1.0
-		}
-
-		h1 := HashFeatures(&f1)
-		h2 := HashFeatures(&f2)
-
-		if h1 == h2 {
-			t.Errorf("Expected different hashes for zero vs non-zero inputs, got %d", h1)
-		}
-	})
-
-	t.Run("SwappedElements", func(t *testing.T) {
-		var f1, f2 [TotalFeatures]float64
-		f1[0] = 1.0
-		f1[1] = 2.0
-
-		f2[0] = 2.0
-		f2[1] = 1.0
-
-		h1 := HashFeatures(&f1)
-		h2 := HashFeatures(&f2)
-
-		if h1 == h2 {
-			t.Errorf("Expected different hashes for swapped elements, got %d", h1)
-		}
-	})
-
-	t.Run("ZeroValuesHash", func(t *testing.T) {
-		var f [TotalFeatures]float64
-		h := HashFeatures(&f)
-		if h == 0 {
-			t.Errorf("Hash of zero array should not be 0")
-		}
-	})
+	out := EvaluateBatchStates(states)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 outputs, got %d", len(out))
+	}
+	if out[0] != 0.5 || out[1] != 1.0 {
+		t.Fatalf("unexpected batch outputs: %v", out)
+	}
 }

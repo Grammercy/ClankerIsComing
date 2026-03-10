@@ -33,12 +33,9 @@ type orderedAction struct {
 }
 
 type searchContext struct {
-	deadline              time.Time
-	useDeadline           bool
-	timedOut              bool
-	useLatentTokens       bool
-	latentReasoningToken  float64
-	latentPredictionToken float64
+	deadline    time.Time
+	useDeadline bool
+	timedOut    bool
 }
 
 type mctsActionStat struct {
@@ -75,14 +72,11 @@ type mctsLeafEvalRequest struct {
 }
 
 type mctsLeafBatcher struct {
-	reqCh                 chan mctsLeafEvalRequest
-	stopCh                chan struct{}
-	wg                    sync.WaitGroup
-	batchSize             int
-	flushWindow           time.Duration
-	useLatentTokens       bool
-	latentReasoningToken  float64
-	latentPredictionToken float64
+	reqCh       chan mctsLeafEvalRequest
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	batchSize   int
+	flushWindow time.Duration
 }
 
 func (ctx *searchContext) shouldStop(nodesSearched int) bool {
@@ -119,11 +113,8 @@ func parsePositiveFloatEnv(name string) (float64, bool) {
 	return v, true
 }
 
-func evaluateWithContext(state *simulator.BattleState, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) float64 {
-	if ctx != nil && ctx.useLatentTokens {
-		return evaluator.EvaluateWithLatentTokens(state, -1, evaluator.GlobalMLP, evaluator.GlobalAttentionMLP, mlpCache, attentionCache, tt, ctx.latentReasoningToken, ctx.latentPredictionToken)
-	}
-	return evaluator.Evaluate(state, -1, evaluator.GlobalMLP, evaluator.GlobalAttentionMLP, mlpCache, attentionCache, tt)
+func evaluateWithContext(state *simulator.BattleState, ctx *searchContext) float64 {
+	return evaluator.EvaluateState(state)
 }
 
 func newMCTSLeafBatcher(batchSize int, flushWindow time.Duration, ctx *searchContext) *mctsLeafBatcher {
@@ -139,11 +130,7 @@ func newMCTSLeafBatcher(batchSize int, flushWindow time.Duration, ctx *searchCon
 		batchSize:   batchSize,
 		flushWindow: flushWindow,
 	}
-	if ctx != nil && ctx.useLatentTokens {
-		b.useLatentTokens = true
-		b.latentReasoningToken = ctx.latentReasoningToken
-		b.latentPredictionToken = ctx.latentPredictionToken
-	}
+	_ = ctx
 	b.wg.Add(1)
 	go b.loop()
 	return b
@@ -177,12 +164,7 @@ func (b *mctsLeafBatcher) loop() {
 		for i, req := range pending {
 			states[i] = req.state
 		}
-		var values []float64
-		if b.useLatentTokens {
-			values = evaluator.EvaluateBatchStatesWithLatentTokens(states, b.latentReasoningToken, b.latentPredictionToken)
-		} else {
-			values = evaluator.EvaluateBatchStates(states)
-		}
+		values := evaluator.EvaluateBatchStates(states)
 		for i, req := range pending {
 			req.resp <- values[i]
 			close(req.resp)
@@ -266,7 +248,7 @@ func orderedActionsByEstimate(candidates []orderedAction, maximizing bool, limit
 	return ordered
 }
 
-func orderRootActions(state *simulator.BattleState, p1Actions [simulator.MaxActions]int, p1Len int, preferredAction int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) []int {
+func orderRootActions(state *simulator.BattleState, p1Actions [simulator.MaxActions]int, p1Len int, preferredAction int, ctx *searchContext) []int {
 	candidates := make([]orderedAction, 0, p1Len)
 	for i := 0; i < p1Len; i++ {
 		p1Action := p1Actions[i]
@@ -288,7 +270,7 @@ func orderRootActions(state *simulator.BattleState, p1Actions [simulator.MaxActi
 		for j := 0; j < p2Len; j++ {
 			newState := *state
 			simulator.ExecuteSpecificTurn(&newState, p1Action, p2Actions[j])
-			estimate := evaluateWithContext(&newState, mlpCache, attentionCache, tt, ctx)
+			estimate := evaluateWithContext(&newState, ctx)
 			if estimate < worstCase {
 				worstCase = estimate
 			}
@@ -299,25 +281,25 @@ func orderRootActions(state *simulator.BattleState, p1Actions [simulator.MaxActi
 	return orderedActionsByEstimate(candidates, true, 0)
 }
 
-func orderP2Responses(state simulator.BattleState, depth int, p1Action int, p2Actions [simulator.MaxActions]int, p2Len int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) []int {
+func orderP2Responses(state simulator.BattleState, depth int, p1Action int, p2Actions [simulator.MaxActions]int, p2Len int, ctx *searchContext) []int {
 	candidates := make([]orderedAction, 0, p2Len)
 	for i := 0; i < p2Len; i++ {
 		p2Action := p2Actions[i]
 		newState := state
 		simulator.ExecuteSpecificTurn(&newState, p1Action, p2Action)
-		estimate := evaluateWithContext(&newState, mlpCache, attentionCache, tt, ctx)
+		estimate := evaluateWithContext(&newState, ctx)
 		candidates = append(candidates, orderedAction{action: p2Action, estimate: estimate})
 	}
 	return orderedActionsByEstimate(candidates, false, beamLimitForDepth(depth))
 }
 
-func orderP1Responses(state simulator.BattleState, depth int, p2Action int, p1Actions [simulator.MaxActions]int, p1Len int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) []int {
+func orderP1Responses(state simulator.BattleState, depth int, p2Action int, p1Actions [simulator.MaxActions]int, p1Len int, ctx *searchContext) []int {
 	candidates := make([]orderedAction, 0, p1Len)
 	for i := 0; i < p1Len; i++ {
 		p1Action := p1Actions[i]
 		newState := state
 		simulator.ExecuteSpecificTurn(&newState, p1Action, p2Action)
-		estimate := evaluateWithContext(&newState, mlpCache, attentionCache, tt, ctx)
+		estimate := evaluateWithContext(&newState, ctx)
 		candidates = append(candidates, orderedAction{action: p1Action, estimate: estimate})
 	}
 	return orderedActionsByEstimate(candidates, true, beamLimitForDepth(depth))
@@ -343,15 +325,15 @@ func ActionToString(state *simulator.BattleState, player *simulator.PlayerState,
 // AlphaBeta performs Negamax search with Alpha-Beta pruning.
 // We pass BattleState BY VALUE (`state simulator.BattleState`) to force it onto the goroutine stack,
 // completely eliminating heap allocations for CloneBattleState.
-func AlphaBeta(state simulator.BattleState, depth int, alpha float64, beta float64, isP1Turn bool, nodesSearched *int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) float64 {
+func AlphaBeta(state simulator.BattleState, depth int, alpha float64, beta float64, isP1Turn bool, nodesSearched *int, ctx *searchContext) float64 {
 	*nodesSearched++
 	if ctx != nil && ctx.shouldStop(*nodesSearched) {
-		return evaluateWithContext(&state, mlpCache, attentionCache, tt, ctx)
+		return evaluateWithContext(&state, ctx)
 	}
 
 	// Terminal: depth exhausted — use NN evaluation
 	if depth == 0 {
-		return evaluateWithContext(&state, mlpCache, attentionCache, tt, ctx)
+		return evaluateWithContext(&state, ctx)
 	}
 
 	// Check for terminal game states (one side has no living Pokemon)
@@ -376,11 +358,11 @@ func AlphaBeta(state simulator.BattleState, depth int, alpha float64, beta float
 			p1Actions[0] = -1 // Pass
 			p1Len = 1
 		}
-		orderedP1Actions := orderP1Responses(state, depth, -1, p1Actions, p1Len, mlpCache, attentionCache, tt, ctx)
+		orderedP1Actions := orderP1Responses(state, depth, -1, p1Actions, p1Len, ctx)
 
 		for _, p1Action := range orderedP1Actions {
 			// For each P1 action, P2 gets to respond (minimizing layer)
-			eval := alphaBetaP2Response(state, depth, alpha, beta, p1Action, nodesSearched, mlpCache, attentionCache, tt, ctx)
+			eval := alphaBetaP2Response(state, depth, alpha, beta, p1Action, nodesSearched, ctx)
 
 			if eval > maxEval {
 				maxEval = eval
@@ -401,10 +383,10 @@ func AlphaBeta(state simulator.BattleState, depth int, alpha float64, beta float
 			p2Actions[0] = -1 // Pass
 			p2Len = 1
 		}
-		orderedP2Actions := orderP2Responses(state, depth, -1, p2Actions, p2Len, mlpCache, attentionCache, tt, ctx)
+		orderedP2Actions := orderP2Responses(state, depth, -1, p2Actions, p2Len, ctx)
 
 		for _, p2Action := range orderedP2Actions {
-			eval := alphaBetaP1Response(state, depth, alpha, beta, p2Action, nodesSearched, mlpCache, attentionCache, tt, ctx)
+			eval := alphaBetaP1Response(state, depth, alpha, beta, p2Action, nodesSearched, ctx)
 
 			if eval < minEval {
 				minEval = eval
@@ -421,21 +403,21 @@ func AlphaBeta(state simulator.BattleState, depth int, alpha float64, beta float
 }
 
 // alphaBetaP2Response: Given P1's chosen action, search over P2's responses
-func alphaBetaP2Response(state simulator.BattleState, depth int, alpha float64, beta float64, p1Action int, nodesSearched *int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) float64 {
+func alphaBetaP2Response(state simulator.BattleState, depth int, alpha float64, beta float64, p1Action int, nodesSearched *int, ctx *searchContext) float64 {
 	minEval := math.MaxFloat64
 	p2Actions, p2Len := simulator.GetSearchActions(&state.P2)
 	if p2Len == 0 {
 		p2Actions[0] = -1
 		p2Len = 1
 	}
-	orderedP2Actions := orderP2Responses(state, depth, p1Action, p2Actions, p2Len, mlpCache, attentionCache, tt, ctx)
+	orderedP2Actions := orderP2Responses(state, depth, p1Action, p2Actions, p2Len, ctx)
 
 	for _, p2Action := range orderedP2Actions {
 		// Clone state (stack allocated value) and execute the turn
 		newState := state // Flat copy on the stack
 		simulator.ExecuteSpecificTurn(&newState, p1Action, p2Action)
 
-		eval := AlphaBeta(newState, depth-1, alpha, beta, true, nodesSearched, mlpCache, attentionCache, tt, ctx)
+		eval := AlphaBeta(newState, depth-1, alpha, beta, true, nodesSearched, ctx)
 
 		if eval < minEval {
 			minEval = eval
@@ -451,20 +433,20 @@ func alphaBetaP2Response(state simulator.BattleState, depth int, alpha float64, 
 }
 
 // alphaBetaP1Response: Given P2's chosen action, search over P1's responses
-func alphaBetaP1Response(state simulator.BattleState, depth int, alpha float64, beta float64, p2Action int, nodesSearched *int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) float64 {
+func alphaBetaP1Response(state simulator.BattleState, depth int, alpha float64, beta float64, p2Action int, nodesSearched *int, ctx *searchContext) float64 {
 	maxEval := -math.MaxFloat64
 	p1Actions, p1Len := simulator.GetSearchActions(&state.P1)
 	if p1Len == 0 {
 		p1Actions[0] = -1
 		p1Len = 1
 	}
-	orderedP1Actions := orderP1Responses(state, depth, p2Action, p1Actions, p1Len, mlpCache, attentionCache, tt, ctx)
+	orderedP1Actions := orderP1Responses(state, depth, p2Action, p1Actions, p1Len, ctx)
 
 	for _, p1Action := range orderedP1Actions {
 		newState := state // Flat stack copy
 		simulator.ExecuteSpecificTurn(&newState, p1Action, p2Action)
 
-		eval := AlphaBeta(newState, depth-1, alpha, beta, false, nodesSearched, mlpCache, attentionCache, tt, ctx)
+		eval := AlphaBeta(newState, depth-1, alpha, beta, false, nodesSearched, ctx)
 
 		if eval > maxEval {
 			maxEval = eval
@@ -662,7 +644,7 @@ func runMCTSSimulation(root *mctsNode, rootState simulator.BattleState, cfg mcts
 		value = v
 	}
 
-	// Backpropagation phase
+	// Value propagation phase
 	for i := len(path) - 1; i >= 0; i-- {
 		step := path[i]
 		step.node.mu.Lock()
@@ -685,7 +667,7 @@ func runMCTSSimulation(root *mctsNode, rootState simulator.BattleState, cfg mcts
 	return steps + 1
 }
 
-func runMCTSSearch(state *simulator.BattleState, cfg mctsConfig, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) SearchResult {
+func runMCTSSearch(state *simulator.BattleState, cfg mctsConfig, ctx *searchContext) SearchResult {
 	p1Actions, p1Len := simulator.GetSearchActions(&state.P1)
 	if p1Len == 0 {
 		return SearchResult{BestAction: -1, Score: 0.5, Depth: cfg.rolloutDepth}
@@ -728,7 +710,7 @@ func runMCTSSearch(state *simulator.BattleState, cfg mctsConfig, mlpCache *evalu
 	}
 	wg.Wait()
 
-	baseEval := evaluateWithContext(state, mlpCache, attentionCache, tt, ctx)
+	baseEval := evaluateWithContext(state, ctx)
 	actionScores := make(map[int]float64, p1Len)
 	bestAction := p1Actions[0]
 	bestScore := -math.MaxFloat64
@@ -765,26 +747,26 @@ func runMCTSSearch(state *simulator.BattleState, cfg mctsConfig, mlpCache *evalu
 }
 
 // SearchBestMove runs parallel MCTS and returns the best P1 action.
-func SearchBestMove(state *simulator.BattleState, depth int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) SearchResult {
-	return SearchBestMoveWithSims(state, depth, 0, mlpCache, attentionCache, tt)
+func SearchBestMove(state *simulator.BattleState, depth int) SearchResult {
+	return SearchBestMoveWithSims(state, depth, 0)
 }
 
-func SearchBestMoveWithSims(state *simulator.BattleState, depth int, sims int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) SearchResult {
+func SearchBestMoveWithSims(state *simulator.BattleState, depth int, sims int) SearchResult {
 	cfg := defaultMCTSConfig(depth)
 	if sims > 0 {
 		cfg.simulations = sims
 	}
-	return runMCTSSearch(state, cfg, mlpCache, attentionCache, tt, nil)
+	return runMCTSSearch(state, cfg, nil)
 }
 
-func searchBestMoveInternal(state *simulator.BattleState, depth int, preferredAction int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, ctx *searchContext) SearchResult {
+func searchBestMoveInternal(state *simulator.BattleState, depth int, preferredAction int, ctx *searchContext) SearchResult {
 	_ = preferredAction
 	cfg := defaultMCTSConfig(depth)
-	return runMCTSSearch(state, cfg, mlpCache, attentionCache, tt, ctx)
+	return runMCTSSearch(state, cfg, ctx)
 }
 
 // IterativeDeepeningSearch runs time-bounded MCTS within the move time budget.
-func IterativeDeepeningSearch(state *simulator.BattleState, maxDuration time.Duration, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) SearchResult {
+func IterativeDeepeningSearch(state *simulator.BattleState, maxDuration time.Duration) SearchResult {
 	rolloutDepth := 3
 	if v, ok := parsePositiveIntEnv("MCTS_ROLLOUT"); ok {
 		rolloutDepth = v
@@ -795,7 +777,7 @@ func IterativeDeepeningSearch(state *simulator.BattleState, maxDuration time.Dur
 		deadline:    time.Now().Add(maxDuration),
 		useDeadline: true,
 	}
-	result := runMCTSSearch(state, cfg, mlpCache, attentionCache, tt, ctx)
+	result := runMCTSSearch(state, cfg, ctx)
 	actionStr := ActionToString(state, &state.P1, result.BestAction)
 	fmt.Printf("  MCTS: Best=%s Score=%.4f Sims=%d\n", actionStr, result.Score, result.NodesSearched)
 	return result
@@ -803,16 +785,16 @@ func IterativeDeepeningSearch(state *simulator.BattleState, maxDuration time.Dur
 
 // SearchEvaluate uses MCTS at a given rollout depth to evaluate who is winning.
 // Returns the score from P1's perspective (>0.5 = P1 favored), and the number of nodes searched.
-func SearchEvaluate(state *simulator.BattleState, depth int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) (float64, int) {
-	return SearchEvaluateWithSims(state, depth, 0, mlpCache, attentionCache, tt)
+func SearchEvaluate(state *simulator.BattleState, depth int) (float64, int) {
+	return SearchEvaluateWithSims(state, depth, 0)
 }
 
-func SearchEvaluateWithSims(state *simulator.BattleState, depth int, sims int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) (float64, int) {
+func SearchEvaluateWithSims(state *simulator.BattleState, depth int, sims int) (float64, int) {
 	if depth <= 0 {
-		score := evaluateWithContext(state, mlpCache, attentionCache, tt, nil)
+		score := evaluateWithContext(state, nil)
 		return score, 1
 	}
-	result := SearchBestMoveWithSims(state, depth, sims, mlpCache, attentionCache, tt)
+	result := SearchBestMoveWithSims(state, depth, sims)
 	return result.Score, result.NodesSearched
 }
 
@@ -828,26 +810,20 @@ func countAlive(player *simulator.PlayerState) int {
 
 // GetDetailedTags runs MCTS and returns a [MaxActions]float64 array containing the
 // Q-values (predicted win probability) for the possible valid actions from this state.
-func GetDetailedTags(state *simulator.BattleState, depth int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) [simulator.MaxActions]float64 {
-	return GetDetailedTagsWithLatents(state, depth, mlpCache, attentionCache, tt, evaluator.DefaultLatentReasoningToken, evaluator.DefaultLatentPredictionToken)
-}
-
-func GetDetailedTagsWithLatents(state *simulator.BattleState, depth int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, latentReasoningToken float64, latentPredictionToken float64) [simulator.MaxActions]float64 {
+func GetDetailedTags(state *simulator.BattleState, depth int) [simulator.MaxActions]float64 {
 	var tags [simulator.MaxActions]float64
 
-	// Depth <= 0 is a pure-network tagging mode (no MCTS).
+	// Depth <= 0 is a pure leaf-evaluation mode (no MCTS).
 	if depth <= 0 {
-		return evaluator.EvaluateAllWithLatentTokens(state, mlpCache, attentionCache, latentReasoningToken, latentPredictionToken)
-	}
-
-	ctx := &searchContext{
-		useLatentTokens:       true,
-		latentReasoningToken:  latentReasoningToken,
-		latentPredictionToken: latentPredictionToken,
+		base := evaluateWithContext(state, nil)
+		for i := 0; i < simulator.MaxActions; i++ {
+			tags[i] = base
+		}
+		return tags
 	}
 
 	// Fallback/fill values for invalid actions. We'll pre-fill with the base evaluation.
-	baseEval := evaluateWithContext(state, mlpCache, attentionCache, tt, ctx)
+	baseEval := evaluateWithContext(state, nil)
 	for i := 0; i < simulator.MaxActions; i++ {
 		tags[i] = baseEval
 	}
@@ -858,7 +834,7 @@ func GetDetailedTagsWithLatents(state *simulator.BattleState, depth int, mlpCach
 	}
 
 	cfg := defaultMCTSConfig(depth)
-	result := runMCTSSearch(state, cfg, mlpCache, attentionCache, tt, ctx)
+	result := runMCTSSearch(state, cfg, nil)
 	for action, score := range result.ActionScores {
 		if action >= 0 && action < simulator.MaxActions {
 			tags[action] = score
@@ -870,24 +846,18 @@ func GetDetailedTagsWithLatents(state *simulator.BattleState, depth int, mlpCach
 
 // GetDetailedTagsWithBudget runs MCTS tagging with an optional simulation override.
 // If simsOverride <= 0, the default simulation budget for the depth is used.
-func GetDetailedTagsWithBudget(state *simulator.BattleState, depth int, simsOverride int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable) [simulator.MaxActions]float64 {
-	return GetDetailedTagsWithBudgetAndLatents(state, depth, simsOverride, mlpCache, attentionCache, tt, evaluator.DefaultLatentReasoningToken, evaluator.DefaultLatentPredictionToken)
-}
-
-func GetDetailedTagsWithBudgetAndLatents(state *simulator.BattleState, depth int, simsOverride int, mlpCache *evaluator.InferenceCache, attentionCache *evaluator.InferenceCache, tt *evaluator.TranspositionTable, latentReasoningToken float64, latentPredictionToken float64) [simulator.MaxActions]float64 {
+func GetDetailedTagsWithBudget(state *simulator.BattleState, depth int, simsOverride int) [simulator.MaxActions]float64 {
 	var tags [simulator.MaxActions]float64
 
 	if depth <= 0 {
-		return evaluator.EvaluateAllWithLatentTokens(state, mlpCache, attentionCache, latentReasoningToken, latentPredictionToken)
+		base := evaluateWithContext(state, nil)
+		for i := 0; i < simulator.MaxActions; i++ {
+			tags[i] = base
+		}
+		return tags
 	}
 
-	ctx := &searchContext{
-		useLatentTokens:       true,
-		latentReasoningToken:  latentReasoningToken,
-		latentPredictionToken: latentPredictionToken,
-	}
-
-	baseEval := evaluateWithContext(state, mlpCache, attentionCache, tt, ctx)
+	baseEval := evaluateWithContext(state, nil)
 	for i := 0; i < simulator.MaxActions; i++ {
 		tags[i] = baseEval
 	}
@@ -901,7 +871,7 @@ func GetDetailedTagsWithBudgetAndLatents(state *simulator.BattleState, depth int
 	if simsOverride > 0 {
 		cfg.simulations = simsOverride
 	}
-	result := runMCTSSearch(state, cfg, mlpCache, attentionCache, tt, ctx)
+	result := runMCTSSearch(state, cfg, nil)
 	for action, score := range result.ActionScores {
 		if action >= 0 && action < simulator.MaxActions {
 			tags[action] = score
