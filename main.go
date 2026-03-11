@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/pokemon-engine/bot"
 	"github.com/pokemon-engine/client"
+	"github.com/pokemon-engine/deepcfr"
 	"github.com/pokemon-engine/evaluator"
 	"github.com/pokemon-engine/gamedata"
 	"github.com/pokemon-engine/parser"
@@ -24,7 +26,7 @@ import (
 )
 
 func main() {
-	cmd := flag.String("cmd", "", "Command to run: 'scrape', 'parse', 'actions', 'verify-actions', 'evaluate', 'bulk-evaluate', 'search-evaluate', 'import', 'live'")
+	cmd := flag.String("cmd", "", "Command to run: 'scrape', 'parse', 'actions', 'verify-actions', 'evaluate', 'bulk-evaluate', 'search-evaluate', 'train-deepcfr', 'deep-evaluate', 'import', 'live'")
 	format := flag.String("format", "gen9randombattle", "Pokemon Showdown format to scrape")
 	numGames := flag.Int("num", 100, "Number of games to scrape")
 	outDir := flag.String("out", "data/replays", "Output directory for scraped replays")
@@ -36,6 +38,16 @@ func main() {
 	player := flag.String("player", "p1", "Player ID to generate actions for (e.g. 'p1' or 'p2')")
 	depth := flag.Int("depth", 2, "Search depth for Alpha-Beta engine (search-evaluate command)")
 	sims := flag.Int("sims", 0, "MCTS simulation count (0 = use depth-based default)")
+	engineName := flag.String("engine", "mcts", "Decision engine for live play: 'mcts' or 'deepcfr'")
+	modelPath := flag.String("model", "data/deepcfr_model.json", "Path to a Deep CFR model file")
+	epochs := flag.Int("epochs", 1, "Training epochs for train-deepcfr")
+	maxFiles := flag.Int("max-files", 0, "Optional cap on replay files used for train-deepcfr")
+	beliefSamples := flag.Int("belief-samples", 8, "Belief samples for Deep CFR training/evaluation")
+	trainAccelerator := flag.String("train-accelerator", "auto", "Training accelerator for train-deepcfr: 'auto', 'cpu', or 'opencl'")
+	trainBatchSize := flag.Int("train-batch-size", 128, "Mini-batch size for GPU-backed Deep CFR training")
+	targetWorkers := flag.Int("target-workers", 0, "Parallel workers for CPU target generation in train-deepcfr (0 = auto)")
+	openclPlatform := flag.String("opencl-platform", "", "Optional OpenCL platform name substring for train-deepcfr")
+	openclDevice := flag.String("opencl-device", "", "Optional OpenCL device name substring for train-deepcfr")
 	moveTimeMs := flag.Int("move-time-ms", int(client.SearchMoveTime/time.Millisecond), "Per-move time budget in milliseconds (live command)")
 	url := flag.String("url", "", "Pokemon Showdown replay URL for import command")
 	// Live bot flags
@@ -46,6 +58,8 @@ func main() {
 
 	if *cmd == "" {
 		fmt.Println("Error: --cmd flag is required.")
+		fmt.Println("Example (Windows): .\\pokemon-engine.exe -cmd parse -in data\\replays")
+		fmt.Println("Example (all platforms): go run . -cmd parse -in data/replays")
 		fmt.Println("\nAvailable Commands:")
 		fmt.Println("  scrape           Download replays from Pokemon Showdown")
 		fmt.Println("  parse            Extract events and data from downloaded replay logs")
@@ -54,8 +68,10 @@ func main() {
 		fmt.Println("  evaluate         Predict win probability for a specific game state")
 		fmt.Println("  bulk-evaluate    Run win probability prediction on a large set of replays")
 		fmt.Println("  search-evaluate  Run search-enhanced evaluation (Alpha-Beta) on replays")
+		fmt.Println("  train-deepcfr    Train an imperfect-information Deep CFR style model from replay logs")
+		fmt.Println("  deep-evaluate    Evaluate a replay decision state with the Deep CFR engine")
 		fmt.Println("  import           Download, parse, and analyze a specific Showdown replay URL")
-		fmt.Println("  live             Run the bot live on Pokemon Showdown (accepts random battles)")
+		fmt.Println("  live             Run the bot live on Pokemon Showdown (supports -engine deepcfr)")
 		fmt.Println("")
 		flag.Usage()
 		os.Exit(1)
@@ -121,9 +137,40 @@ func main() {
 		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
 			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
 		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
 		err := runSearchEvaluateBulkCommand(*inDir, *turn, *depth, *sims)
 		if err != nil {
 			fmt.Printf("Search evaluation failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "train-deepcfr":
+		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
+			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
+		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
+		err := runTrainDeepCFRCommand(*inDir, *modelPath, *epochs, *maxFiles, *beliefSamples, *depth, *trainAccelerator, *trainBatchSize, *targetWorkers, *openclPlatform, *openclDevice)
+		if err != nil {
+			fmt.Printf("Deep CFR training failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "deep-evaluate":
+		if *file == "" {
+			fmt.Println("Error: --file is required for the 'deep-evaluate' command.")
+			os.Exit(1)
+		}
+		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
+			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
+		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
+		err := runDeepEvaluateCommand(*file, *turn, *player, *modelPath, *beliefSamples, *depth)
+		if err != nil {
+			fmt.Printf("Deep CFR evaluation failed: %v\n", err)
 			os.Exit(1)
 		}
 	case "import":
@@ -146,7 +193,7 @@ func main() {
 			fmt.Println("Example: go run . -cmd live -user MyBot -pass MyPassword")
 			os.Exit(1)
 		}
-		err := client.RunBot(*user, *pass, time.Duration(*moveTimeMs)*time.Millisecond)
+		err := client.RunBot(*user, *pass, time.Duration(*moveTimeMs)*time.Millisecond, *engineName, *modelPath)
 		if err != nil {
 			fmt.Printf("Bot error: %v\n", err)
 			os.Exit(1)
@@ -155,6 +202,83 @@ func main() {
 		fmt.Printf("Unknown command: %s\n", *cmd)
 		os.Exit(1)
 	}
+}
+
+func runTrainDeepCFRCommand(inDir string, modelPath string, epochs int, maxFiles int, beliefSamples int, depth int, accelerator string, batchSize int, targetWorkers int, openclPlatform string, openclDevice string) error {
+	fmt.Printf("Training Deep CFR model from %s\n", inDir)
+	model, stats, err := deepcfr.TrainFromReplayDir(deepcfr.TrainConfig{
+		ReplayDir:         inDir,
+		ModelPath:         modelPath,
+		Epochs:            epochs,
+		MaxFiles:          maxFiles,
+		Seed:              1,
+		BeliefSamples:     beliefSamples,
+		OpponentSamples:   3,
+		TargetDepth:       depth,
+		LearningRate:      0.0005,
+		ReplayPolicyBlend: 0.35,
+		ChosenActionBonus: 0.10,
+		ProgressWriter:    os.Stdout,
+		ProgressInterval:  10 * time.Second,
+		Accelerator:       accelerator,
+		BatchSize:         batchSize,
+		TargetWorkers:     targetWorkers,
+		OpenCLPlatform:    openclPlatform,
+		OpenCLDevice:      openclDevice,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Saved model to %s\n", modelPath)
+	fmt.Printf("Backend: %s\n", stats.Backend)
+	fmt.Printf("Files Seen: %d\n", stats.FilesSeen)
+	fmt.Printf("Positions: %d\n", stats.Positions)
+	fmt.Printf("Average Loss: %.6f\n", stats.AverageLoss)
+	fmt.Printf("Average Value MAE: %.6f\n", stats.AverageValueMAE)
+	fmt.Printf("Average Policy CE: %.6f\n", stats.AveragePolicyCE)
+	if model != nil && model.Priors != nil {
+		fmt.Printf("Species Priors Learned: %d\n", len(model.Priors.SpeciesCounts))
+	}
+	return nil
+}
+
+func runDeepEvaluateCommand(filePath string, targetTurn int, playerID string, modelPath string, beliefSamples int, depth int) error {
+	replay, err := parser.ParseLogFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to parse replay: %w", err)
+	}
+	model, err := deepcfr.LoadModel(modelPath)
+	if err != nil {
+		return err
+	}
+	state, actualAction, hasActual := deepcfr.DecisionStateForTurn(replay, targetTurn, playerID)
+	engine := deepcfr.NewEngine(model, 1)
+	result := engine.Evaluate(state, deepcfr.SearchConfig{
+		BeliefSamples:   beliefSamples,
+		OpponentSamples: 3,
+		Depth:           depth,
+	})
+
+	fmt.Printf("Deep CFR evaluation for %s turn %d (%s perspective)\n", filePath, targetTurn, playerID)
+	fmt.Printf("Win Probability: %.2f%%\n", result.WinProbability*100.0)
+	fmt.Printf("Recommended Action: %s\n", bot.ActionToString(state, &state.P1, result.BestAction))
+	if hasActual {
+		fmt.Printf("Replay Action: %s\n", bot.ActionToString(state, &state.P1, actualAction))
+	}
+	fmt.Println("Action Values:")
+	actions := make([]int, 0, len(result.ActionValues))
+	for action := range result.ActionValues {
+		actions = append(actions, action)
+	}
+	sort.Ints(actions)
+	for _, action := range actions {
+		fmt.Printf("  %-28s value=%.4f policy=%.4f\n",
+			bot.ActionToString(state, &state.P1, action),
+			result.ActionValues[action],
+			result.ActionPolicy[action],
+		)
+	}
+	return nil
 }
 
 func runParseCommand(inDir string) error {

@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/pokemon-engine/bot"
+	"github.com/pokemon-engine/deepcfr"
 	"github.com/pokemon-engine/gamedata"
 	"github.com/pokemon-engine/simulator"
 )
@@ -28,10 +29,12 @@ type ShowdownBot struct {
 	password string
 	battles  map[string]*BattleContext // roomID -> context
 	moveTime time.Duration
+	engine   string
+	model    *deepcfr.Model
 }
 
 // RunBot is the main entry point for the live bot
-func RunBot(username, password string, moveTime time.Duration) error {
+func RunBot(username, password string, moveTime time.Duration, engineName string, modelPath string) error {
 	// Load game data
 	if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
 		log.Printf("Warning: Pokedex not loaded: %v", err)
@@ -39,11 +42,22 @@ func RunBot(username, password string, moveTime time.Duration) error {
 	if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
 		log.Printf("Warning: Movedex not loaded: %v", err)
 	}
+	var model *deepcfr.Model
+	if engineName == "deepcfr" && modelPath != "" {
+		loaded, err := deepcfr.LoadModel(modelPath)
+		if err != nil {
+			return fmt.Errorf("failed to load Deep CFR model: %w", err)
+		}
+		model = loaded
+	}
+
 	bot := &ShowdownBot{
 		username: username,
 		password: password,
 		battles:  make(map[string]*BattleContext),
 		moveTime: moveTime,
+		engine:   engineName,
+		model:    model,
 	}
 
 	log.Printf("Connecting to Pokemon Showdown (%s)...", ShowdownWSURL)
@@ -696,7 +710,7 @@ func (b *ShowdownBot) onRequest(roomID, data string) {
 	ctx.State = state
 	DebugPrintState(roomID, state)
 
-	choice, actionIdx, searchResult := ChooseBestAction(&req, b.moveTime, ctx.State)
+	choice, actionIdx, searchResult := ChooseBestAction(&req, b.moveTime, ctx.State, b.engine, b.model)
 	if choice == "" {
 		return
 	}
@@ -757,7 +771,7 @@ func (b *ShowdownBot) onTeamPreview(roomID string) {
 	}
 
 	ctx.Request.TeamPreview = true
-	choice, _, _ := ChooseBestAction(ctx.Request, b.moveTime, ctx.State)
+	choice, _, _ := ChooseBestAction(ctx.Request, b.moveTime, ctx.State, b.engine, b.model)
 	cmd := fmt.Sprintf("/choose %s|%d", choice, ctx.Request.Rqid)
 	b.send(roomID, cmd)
 	log.Printf("[%s] Team Preview: %s", roomID, cmd)

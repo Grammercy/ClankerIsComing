@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pokemon-engine/bot"
+	"github.com/pokemon-engine/deepcfr"
 	"github.com/pokemon-engine/gamedata"
 	"github.com/pokemon-engine/simulator"
 )
@@ -256,7 +257,7 @@ func buildPlayerState(pokemon []ShowdownPokemon, playerID string, currentPlayer 
 
 // ChooseBestAction runs iterative deepening search and converts the result to a Showdown /choose command.
 // Returns (choiceString, actionIndex, searchResult). actionIndex is -1 for non-combat decisions.
-func ChooseBestAction(req *ShowdownRequest, moveTime time.Duration, currentBattleState *simulator.BattleState) (string, int, bot.SearchResult) {
+func ChooseBestAction(req *ShowdownRequest, moveTime time.Duration, currentBattleState *simulator.BattleState, engineName string, model *deepcfr.Model) (string, int, bot.SearchResult) {
 
 	// Handle team preview
 	if req.TeamPreview {
@@ -269,6 +270,21 @@ func ChooseBestAction(req *ShowdownRequest, moveTime time.Duration, currentBattl
 	}
 
 	state := RequestToBattleState(req, currentBattleState)
+	if engineName == "deepcfr" && model != nil {
+		engine := deepcfr.NewEngine(model, time.Now().UnixNano())
+		deepResult := engine.Evaluate(state, deepcfr.SearchConfig{
+			BeliefSamples:   10,
+			OpponentSamples: 3,
+			Depth:           2,
+		})
+		return actionToShowdown(deepResult.BestAction, req), deepResult.BestAction, bot.SearchResult{
+			BestAction:   deepResult.BestAction,
+			Score:        deepResult.WinProbability,
+			Depth:        deepResult.Depth,
+			ActionScores: deepResult.ActionValues,
+		}
+	}
+
 	result := bot.IterativeDeepeningSearch(state, moveTime)
 
 	return actionToShowdown(result.BestAction, req), result.BestAction, result
