@@ -12,9 +12,11 @@ This repository is a Go CLI for Pokemon Showdown tooling and battle simulation. 
 - `reports/` and `gaps_report.md`: audits and simulator coverage notes.
 
 ## Build, Test, and Development Commands
-- `make build`: build the local binary (`pokemon-engine.exe` by default).
+- `make build`: cross-compile a Windows binary (`pokemon-engine.exe` by default).
+- `make build-local`: build the local binary.
 - `make test`: run the full Go test suite with `go test ./...`.
 - `make windows`: cross-compile a Windows binary; requires `x86_64-w64-mingw32-gcc/g++`.
+- `make windows-opencl`: cross-compile a Windows binary with OpenCL backend; requires cross OpenCL/CLBlast dev packages available to `x86_64-w64-mingw32-pkg-config`.
 - `go run . -cmd parse -in data/replays`: parse downloaded replay logs.
 - `go run . -cmd live -user <name> -pass <pass>`: run the live Showdown bot.
 
