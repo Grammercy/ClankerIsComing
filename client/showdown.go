@@ -14,6 +14,7 @@ import (
 	"github.com/pokemon-engine/bot"
 	"github.com/pokemon-engine/deepcfr"
 	"github.com/pokemon-engine/gamedata"
+	"github.com/pokemon-engine/neuralv2"
 	"github.com/pokemon-engine/simulator"
 )
 
@@ -24,13 +25,14 @@ const (
 
 // ShowdownBot manages the WebSocket lifecycle
 type ShowdownBot struct {
-	conn     *websocket.Conn
-	username string
-	password string
-	battles  map[string]*BattleContext // roomID -> context
-	moveTime time.Duration
-	engine   string
-	model    *deepcfr.Model
+	conn        *websocket.Conn
+	username    string
+	password    string
+	battles     map[string]*BattleContext // roomID -> context
+	moveTime    time.Duration
+	engine      string
+	deepModel   *deepcfr.Model
+	neuralModel *neuralv2.Model
 }
 
 // RunBot is the main entry point for the live bot
@@ -43,6 +45,7 @@ func RunBot(username, password string, moveTime time.Duration, engineName string
 		log.Printf("Warning: Movedex not loaded: %v", err)
 	}
 	var model *deepcfr.Model
+	var neuralModel *neuralv2.Model
 	if engineName == "deepcfr" && modelPath != "" {
 		loaded, err := deepcfr.LoadModel(modelPath)
 		if err != nil {
@@ -50,14 +53,25 @@ func RunBot(username, password string, moveTime time.Duration, engineName string
 		}
 		model = loaded
 	}
+	if engineName == "neuralv2" && modelPath != "" {
+		loaded, err := neuralv2.LoadModel(neuralv2.LoadConfig{
+			Path: modelPath,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to load neuralv2 model: %w", err)
+		}
+		neuralModel = loaded
+		log.Printf("Loaded neuralv2 backend: %s", neuralModel.BackendName())
+	}
 
 	bot := &ShowdownBot{
-		username: username,
-		password: password,
-		battles:  make(map[string]*BattleContext),
-		moveTime: moveTime,
-		engine:   engineName,
-		model:    model,
+		username:    username,
+		password:    password,
+		battles:     make(map[string]*BattleContext),
+		moveTime:    moveTime,
+		engine:      engineName,
+		deepModel:   model,
+		neuralModel: neuralModel,
 	}
 
 	log.Printf("Connecting to Pokemon Showdown (%s)...", ShowdownWSURL)
@@ -710,7 +724,7 @@ func (b *ShowdownBot) onRequest(roomID, data string) {
 	ctx.State = state
 	DebugPrintState(roomID, state)
 
-	choice, actionIdx, searchResult := ChooseBestAction(&req, b.moveTime, ctx.State, b.engine, b.model)
+	choice, actionIdx, searchResult := ChooseBestAction(&req, b.moveTime, ctx.State, b.engine, b.deepModel, b.neuralModel)
 	if choice == "" {
 		return
 	}
@@ -771,7 +785,7 @@ func (b *ShowdownBot) onTeamPreview(roomID string) {
 	}
 
 	ctx.Request.TeamPreview = true
-	choice, _, _ := ChooseBestAction(ctx.Request, b.moveTime, ctx.State, b.engine, b.model)
+	choice, _, _ := ChooseBestAction(ctx.Request, b.moveTime, ctx.State, b.engine, b.deepModel, b.neuralModel)
 	cmd := fmt.Sprintf("/choose %s|%d", choice, ctx.Request.Rqid)
 	b.send(roomID, cmd)
 	log.Printf("[%s] Team Preview: %s", roomID, cmd)
