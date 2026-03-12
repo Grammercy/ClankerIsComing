@@ -35,6 +35,7 @@ type TrainConfig struct {
 	OpenCLPlatform    string
 	OpenCLDevice      string
 	TargetWorkers     int
+	StopChan          <-chan struct{}
 }
 
 type TrainStats struct {
@@ -44,6 +45,7 @@ type TrainStats struct {
 	AverageLoss     float64
 	AverageValueMAE float64
 	AveragePolicyCE float64
+	Interrupted     bool
 }
 
 type replayPosition struct {
@@ -377,6 +379,18 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 			}
 		}
 	}
+	shouldStop := func() bool {
+		if cfg.StopChan == nil {
+			return false
+		}
+		select {
+		case <-cfg.StopChan:
+			return true
+		default:
+			return false
+		}
+	}
+	interrupted := false
 
 	for epoch := 0; epoch < cfg.Epochs; epoch++ {
 		filesSeen := 0
@@ -387,6 +401,10 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 			return entries[i].Name() < entries[j].Name()
 		})
 		for _, entry := range entries {
+			if shouldStop() {
+				interrupted = true
+				break
+			}
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
 				continue
 			}
@@ -421,22 +439,32 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 				return nil, stats, err
 			}
 			for _, example := range examples {
+				if shouldStop() {
+					interrupted = true
+					break
+				}
 				metrics, err := trainer.Train(example)
 				if err != nil {
 					return nil, stats, err
 				}
 				recordMetrics(metrics)
 			}
-			metrics, err := trainer.Flush()
-			if err != nil {
-				return nil, stats, err
+			if interrupted {
+				break
 			}
-			recordMetrics(metrics)
 			filesSeen++
 			stats.FilesSeen++
 			if progress != nil {
 				progress.recordFileComplete(false)
 			}
+		}
+		metrics, err := trainer.Flush()
+		if err != nil {
+			return nil, stats, err
+		}
+		recordMetrics(metrics)
+		if interrupted {
+			break
 		}
 	}
 	metrics, err := trainer.Flush()
@@ -444,6 +472,10 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 		return nil, stats, err
 	}
 	recordMetrics(metrics)
+	stats.Interrupted = interrupted
+	if interrupted && cfg.ProgressWriter != nil {
+		fmt.Fprintln(cfg.ProgressWriter, "training interrupted: checkpointing current model state")
+	}
 
 	if stats.Positions > 0 {
 		stats.AverageLoss /= float64(stats.Positions)

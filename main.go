@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -8,25 +10,30 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/pokemon-engine/arena"
 	"github.com/pokemon-engine/bot"
 	"github.com/pokemon-engine/client"
 	"github.com/pokemon-engine/deepcfr"
 	"github.com/pokemon-engine/evaluator"
 	"github.com/pokemon-engine/gamedata"
+	"github.com/pokemon-engine/neuralv2"
 	"github.com/pokemon-engine/parser"
 	"github.com/pokemon-engine/scraper"
 	"github.com/pokemon-engine/simulator"
 )
 
 func main() {
-	cmd := flag.String("cmd", "", "Command to run: 'scrape', 'parse', 'actions', 'verify-actions', 'evaluate', 'bulk-evaluate', 'search-evaluate', 'train-deepcfr', 'deep-evaluate', 'import', 'live'")
+	cmd := flag.String("cmd", "", "Command to run: 'scrape', 'parse', 'actions', 'verify-actions', 'evaluate', 'bulk-evaluate', 'search-evaluate', 'train-deepcfr', 'train-neuralv2', 'deep-evaluate', 'neural-evaluate', 'eval-latency', 'eval-elo', 'selfplay-generate', 'export-onnx', 'import', 'live'")
 	format := flag.String("format", "gen9randombattle", "Pokemon Showdown format to scrape")
 	numGames := flag.Int("num", 100, "Number of games to scrape")
 	outDir := flag.String("out", "data/replays", "Output directory for scraped replays")
@@ -38,17 +45,26 @@ func main() {
 	player := flag.String("player", "p1", "Player ID to generate actions for (e.g. 'p1' or 'p2')")
 	depth := flag.Int("depth", 2, "Search depth for Alpha-Beta engine (search-evaluate command)")
 	sims := flag.Int("sims", 0, "MCTS simulation count (0 = use depth-based default)")
-	engineName := flag.String("engine", "mcts", "Decision engine for live play: 'mcts' or 'deepcfr'")
-	modelPath := flag.String("model", "data/deepcfr_model.json", "Path to a Deep CFR model file")
+	engineName := flag.String("engine", "mcts", "Decision engine for live play: 'mcts', 'deepcfr', or 'neuralv2'")
+	modelPath := flag.String("model", "data/deepcfr_model.json", "Path to a model file (Deep CFR JSON or ONNX for neuralv2)")
 	epochs := flag.Int("epochs", 1, "Training epochs for train-deepcfr")
 	maxFiles := flag.Int("max-files", 0, "Optional cap on replay files used for train-deepcfr")
 	beliefSamples := flag.Int("belief-samples", 8, "Belief samples for Deep CFR training/evaluation")
 	trainAccelerator := flag.String("train-accelerator", "auto", "Training accelerator for train-deepcfr: 'auto', 'cpu', or 'opencl'")
-	trainBatchSize := flag.Int("train-batch-size", 128, "Mini-batch size for GPU-backed Deep CFR training")
+	trainBatchSize := flag.Int("train-batch-size", 512, "Mini-batch size for GPU-backed Deep CFR training")
 	targetWorkers := flag.Int("target-workers", 0, "Parallel workers for CPU target generation in train-deepcfr (0 = auto)")
 	openclPlatform := flag.String("opencl-platform", "", "Optional OpenCL platform name substring for train-deepcfr")
 	openclDevice := flag.String("opencl-device", "", "Optional OpenCL device name substring for train-deepcfr")
 	moveTimeMs := flag.Int("move-time-ms", int(client.SearchMoveTime/time.Millisecond), "Per-move time budget in milliseconds (live command)")
+	engineA := flag.String("engine-a", "neuralv2", "Engine A for eval-elo/selfplay-generate: 'mcts', 'deepcfr', or 'neuralv2'")
+	engineB := flag.String("engine-b", "mcts", "Engine B for eval-elo/selfplay-generate: 'mcts', 'deepcfr', or 'neuralv2'")
+	modelAPath := flag.String("model-a", "data/deepcfr_model.json", "Model path for engine A")
+	modelBPath := flag.String("model-b", "data/deepcfr_model.json", "Model path for engine B")
+	latencySamples := flag.Int("latency-samples", 100, "Number of decision states to time in eval-latency")
+	matches := flag.Int("matches", 100, "Number of matches for eval-elo/selfplay-generate")
+	maxTurns := flag.Int("max-turns", 24, "Turn cap for eval-elo/selfplay-generate rollouts")
+	outFile := flag.String("out-file", "data/selfplay/selfplay.jsonl", "Output file for selfplay-generate or export-onnx")
+	onnxOutPath := flag.String("onnx-out", "data/neuralv2_model.onnx", "Output ONNX path for export-onnx")
 	url := flag.String("url", "", "Pokemon Showdown replay URL for import command")
 	// Live bot flags
 	user := flag.String("user", "", "Pokemon Showdown username for live bot")
@@ -69,9 +85,15 @@ func main() {
 		fmt.Println("  bulk-evaluate    Run win probability prediction on a large set of replays")
 		fmt.Println("  search-evaluate  Run search-enhanced evaluation (Alpha-Beta) on replays")
 		fmt.Println("  train-deepcfr    Train an imperfect-information Deep CFR style model from replay logs")
+		fmt.Println("  train-neuralv2   Bootstrap neuralv2 training (non-CUDA path)")
 		fmt.Println("  deep-evaluate    Evaluate a replay decision state with the Deep CFR engine")
+		fmt.Println("  neural-evaluate  Evaluate a replay decision state with the neuralv2 engine")
+		fmt.Println("  eval-latency     Benchmark per-decision latency on replay states")
+		fmt.Println("  eval-elo         Run head-to-head Elo evaluation between two engines")
+		fmt.Println("  selfplay-generate Generate self-play rollout traces as JSONL")
+		fmt.Println("  export-onnx      Export Deep CFR JSON weights to ONNX (CPU/ROCm workflow)")
 		fmt.Println("  import           Download, parse, and analyze a specific Showdown replay URL")
-		fmt.Println("  live             Run the bot live on Pokemon Showdown (supports -engine deepcfr)")
+		fmt.Println("  live             Run the bot live on Pokemon Showdown (supports -engine deepcfr/neuralv2)")
 		fmt.Println("")
 		flag.Usage()
 		os.Exit(1)
@@ -157,6 +179,18 @@ func main() {
 			fmt.Printf("Deep CFR training failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "train-neuralv2":
+		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
+			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
+		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
+		err := runTrainNeuralV2Command(*inDir, *modelPath, *epochs, *maxFiles, *beliefSamples, *depth, *trainAccelerator, *trainBatchSize, *targetWorkers, *openclPlatform, *openclDevice)
+		if err != nil {
+			fmt.Printf("Neuralv2 training failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "deep-evaluate":
 		if *file == "" {
 			fmt.Println("Error: --file is required for the 'deep-evaluate' command.")
@@ -171,6 +205,64 @@ func main() {
 		err := runDeepEvaluateCommand(*file, *turn, *player, *modelPath, *beliefSamples, *depth)
 		if err != nil {
 			fmt.Printf("Deep CFR evaluation failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "neural-evaluate":
+		if *file == "" {
+			fmt.Println("Error: --file is required for the 'neural-evaluate' command.")
+			os.Exit(1)
+		}
+		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
+			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
+		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
+		err := runNeuralEvaluateCommand(*file, *turn, *player, *modelPath, *beliefSamples, *depth, time.Duration(*moveTimeMs)*time.Millisecond)
+		if err != nil {
+			fmt.Printf("Neuralv2 evaluation failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "eval-latency":
+		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
+			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
+		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
+		err := runEvalLatencyCommand(*inDir, *engineA, *modelAPath, *latencySamples, *beliefSamples, *depth, time.Duration(*moveTimeMs)*time.Millisecond)
+		if err != nil {
+			fmt.Printf("Latency evaluation failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "eval-elo":
+		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
+			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
+		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
+		err := runEvalEloCommand(*inDir, *engineA, *modelAPath, *engineB, *modelBPath, *matches, *maxTurns, *beliefSamples, *depth, time.Duration(*moveTimeMs)*time.Millisecond)
+		if err != nil {
+			fmt.Printf("Elo evaluation failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "selfplay-generate":
+		if err := gamedata.LoadPokedex("data/pokedex.json"); err != nil {
+			fmt.Printf("Warning: Pokedex not loaded: %v\n", err)
+		}
+		if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
+			fmt.Printf("Warning: Movedex not loaded: %v\n", err)
+		}
+		err := runSelfPlayGenerateCommand(*inDir, *engineA, *modelAPath, *engineB, *modelBPath, *matches, *maxTurns, *beliefSamples, *depth, time.Duration(*moveTimeMs)*time.Millisecond, *outFile)
+		if err != nil {
+			fmt.Printf("Self-play generation failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "export-onnx":
+		err := runExportONNXCommand(*modelPath, *onnxOutPath)
+		if err != nil {
+			fmt.Printf("ONNX export failed: %v\n", err)
 			os.Exit(1)
 		}
 	case "import":
@@ -206,6 +298,38 @@ func main() {
 
 func runTrainDeepCFRCommand(inDir string, modelPath string, epochs int, maxFiles int, beliefSamples int, depth int, accelerator string, batchSize int, targetWorkers int, openclPlatform string, openclDevice string) error {
 	fmt.Printf("Training Deep CFR model from %s\n", inDir)
+	fmt.Println("Press Ctrl+C or type 'q' then Enter to stop early and save a checkpoint.")
+
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	requestStop := func(reason string) {
+		stopOnce.Do(func() {
+			fmt.Printf("\nStop requested (%s). Finishing current step before checkpointing...\n", reason)
+			close(stopCh)
+		})
+	}
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalCh)
+	go func() {
+		<-signalCh
+		requestStop("signal")
+	}()
+
+	if info, err := os.Stdin.Stat(); err == nil && (info.Mode()&os.ModeCharDevice) != 0 {
+		go func() {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				text := strings.TrimSpace(strings.ToLower(scanner.Text()))
+				if text == "q" || text == "quit" || text == "exit" || text == "stop" {
+					requestStop("keyboard")
+					return
+				}
+			}
+		}()
+	}
+
 	model, stats, err := deepcfr.TrainFromReplayDir(deepcfr.TrainConfig{
 		ReplayDir:         inDir,
 		ModelPath:         modelPath,
@@ -225,11 +349,16 @@ func runTrainDeepCFRCommand(inDir string, modelPath string, epochs int, maxFiles
 		TargetWorkers:     targetWorkers,
 		OpenCLPlatform:    openclPlatform,
 		OpenCLDevice:      openclDevice,
+		StopChan:          stopCh,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Saved model to %s\n", modelPath)
+	if stats.Interrupted {
+		fmt.Printf("Training interrupted early. Saved checkpoint to %s\n", modelPath)
+	} else {
+		fmt.Printf("Saved model to %s\n", modelPath)
+	}
 	fmt.Printf("Backend: %s\n", stats.Backend)
 	fmt.Printf("Files Seen: %d\n", stats.FilesSeen)
 	fmt.Printf("Positions: %d\n", stats.Positions)
@@ -265,6 +394,62 @@ func runDeepEvaluateCommand(filePath string, targetTurn int, playerID string, mo
 	if hasActual {
 		fmt.Printf("Replay Action: %s\n", bot.ActionToString(state, &state.P1, actualAction))
 	}
+	fmt.Println("Action Values:")
+	actions := make([]int, 0, len(result.ActionValues))
+	for action := range result.ActionValues {
+		actions = append(actions, action)
+	}
+	sort.Ints(actions)
+	for _, action := range actions {
+		fmt.Printf("  %-28s value=%.4f policy=%.4f\n",
+			bot.ActionToString(state, &state.P1, action),
+			result.ActionValues[action],
+			result.ActionPolicy[action],
+		)
+	}
+	return nil
+}
+
+func runTrainNeuralV2Command(inDir string, modelPath string, epochs int, maxFiles int, beliefSamples int, depth int, accelerator string, batchSize int, targetWorkers int, openclPlatform string, openclDevice string) error {
+	if strings.EqualFold(accelerator, "cuda") {
+		return fmt.Errorf("cuda backend is not supported; use cpu, opencl, or auto")
+	}
+	fmt.Println("train-neuralv2 currently bootstraps from the non-CUDA Deep CFR trainer.")
+	return runTrainDeepCFRCommand(inDir, modelPath, epochs, maxFiles, beliefSamples, depth, accelerator, batchSize, targetWorkers, openclPlatform, openclDevice)
+}
+
+func runNeuralEvaluateCommand(filePath string, targetTurn int, playerID string, modelPath string, beliefSamples int, depth int, moveBudget time.Duration) error {
+	replay, err := parser.ParseLogFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to parse replay: %w", err)
+	}
+	model, err := neuralv2.LoadModel(neuralv2.LoadConfig{
+		Path: modelPath,
+	})
+	if err != nil {
+		return err
+	}
+	defer model.Close()
+
+	state, actualAction, hasActual := deepcfr.DecisionStateForTurn(replay, targetTurn, playerID)
+	result := model.Evaluate(state, neuralv2.SearchConfig{
+		BeliefSamples:   beliefSamples,
+		OpponentSamples: 3,
+		Depth:           depth,
+		TimeBudget:      minDuration(moveBudget, 650*time.Millisecond),
+		MaxSimulations:  96,
+		TopK:            6,
+	})
+
+	fmt.Printf("Neuralv2 evaluation for %s turn %d (%s perspective)\n", filePath, targetTurn, playerID)
+	fmt.Printf("Backend: %s\n", model.BackendName())
+	fmt.Printf("Win Probability: %.2f%%\n", result.WinProbability*100.0)
+	fmt.Printf("Recommended Action: %s\n", bot.ActionToString(state, &state.P1, result.BestAction))
+	if hasActual {
+		fmt.Printf("Replay Action: %s\n", bot.ActionToString(state, &state.P1, actualAction))
+	}
+	fmt.Printf("Simulations: %d | Latency: %s\n", result.Simulations, result.Latency.Round(time.Millisecond))
+
 	fmt.Println("Action Values:")
 	actions := make([]int, 0, len(result.ActionValues))
 	for action := range result.ActionValues {
@@ -994,6 +1179,396 @@ func mapReplayEventChosenAction(replay *parser.Replay, state *simulator.BattleSt
 	default:
 		return -1, false
 	}
+}
+
+type mctsArenaAgent struct {
+	depth int
+	sims  int
+}
+
+func (a *mctsArenaAgent) Name() string {
+	return "mcts"
+}
+
+func (a *mctsArenaAgent) Choose(state *simulator.BattleState) int {
+	depth := a.depth
+	if depth <= 0 {
+		depth = 2
+	}
+	result := bot.SearchBestMoveWithSims(state, depth, a.sims)
+	return result.BestAction
+}
+
+type deepCFRArenaAgent struct {
+	model         *deepcfr.Model
+	beliefSamples int
+	depth         int
+}
+
+func (a *deepCFRArenaAgent) Name() string {
+	return "deepcfr"
+}
+
+func (a *deepCFRArenaAgent) Choose(state *simulator.BattleState) int {
+	engine := deepcfr.NewEngine(a.model, time.Now().UnixNano())
+	result := engine.Evaluate(state, deepcfr.SearchConfig{
+		BeliefSamples:   a.beliefSamples,
+		OpponentSamples: 3,
+		Depth:           a.depth,
+	})
+	return result.BestAction
+}
+
+type neuralArenaAgent struct {
+	model *neuralv2.Model
+	cfg   neuralv2.SearchConfig
+}
+
+func (a *neuralArenaAgent) Name() string {
+	return "neuralv2/" + a.model.BackendName()
+}
+
+func (a *neuralArenaAgent) Choose(state *simulator.BattleState) int {
+	result := a.model.Evaluate(state, a.cfg)
+	return result.BestAction
+}
+
+func buildArenaAgent(engineName string, modelPath string, beliefSamples int, depth int, moveBudget time.Duration) (arena.Agent, func(), error) {
+	switch strings.ToLower(strings.TrimSpace(engineName)) {
+	case "mcts":
+		return &mctsArenaAgent{depth: depth, sims: 0}, func() {}, nil
+	case "deepcfr":
+		model, err := deepcfr.LoadModel(modelPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &deepCFRArenaAgent{
+			model:         model,
+			beliefSamples: beliefSamples,
+			depth:         depth,
+		}, func() {}, nil
+	case "neuralv2":
+		model, err := neuralv2.LoadModel(neuralv2.LoadConfig{
+			Path: modelPath,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return &neuralArenaAgent{
+			model: model,
+			cfg: neuralv2.SearchConfig{
+				BeliefSamples:   beliefSamples,
+				OpponentSamples: 3,
+				Depth:           depth,
+				TimeBudget:      minDuration(moveBudget, 650*time.Millisecond),
+				MaxSimulations:  96,
+				TopK:            6,
+			},
+		}, func() { _ = model.Close() }, nil
+	default:
+		return nil, nil, fmt.Errorf("unknown engine %q (expected mcts, deepcfr, or neuralv2)", engineName)
+	}
+}
+
+func collectDecisionStates(inDir string, maxStates int) ([]simulator.BattleState, error) {
+	if maxStates <= 0 {
+		maxStates = 1
+	}
+	entries, err := os.ReadDir(inDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read replay dir: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	states := make([]simulator.BattleState, 0, maxStates)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		replay, err := parser.ParseLogFile(path.Join(inDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		for turn := 1; turn <= replay.Turns; turn++ {
+			state, _, ok := deepcfr.DecisionStateForTurn(replay, turn, "p1")
+			if !ok || state == nil {
+				continue
+			}
+			states = append(states, *state)
+			if len(states) >= maxStates {
+				return states, nil
+			}
+		}
+	}
+	if len(states) == 0 {
+		return nil, fmt.Errorf("no decision states found in %s", inDir)
+	}
+	return states, nil
+}
+
+func runEvalLatencyCommand(inDir string, engineName string, modelPath string, sampleCount int, beliefSamples int, depth int, moveBudget time.Duration) error {
+	if sampleCount <= 0 {
+		sampleCount = 100
+	}
+	states, err := collectDecisionStates(inDir, sampleCount*2)
+	if err != nil {
+		return err
+	}
+	agent, cleanup, err := buildArenaAgent(engineName, modelPath, beliefSamples, depth, moveBudget)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	rng := rand.New(rand.NewSource(1))
+	latencies := make([]time.Duration, 0, sampleCount)
+	invalid := 0
+	for i := 0; i < sampleCount; i++ {
+		state := states[rng.Intn(len(states))]
+		start := time.Now()
+		action := agent.Choose(&state)
+		latencies = append(latencies, time.Since(start))
+		if action < 0 {
+			invalid++
+		}
+	}
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	total := time.Duration(0)
+	for _, d := range latencies {
+		total += d
+	}
+
+	fmt.Printf("Latency benchmark (%s)\n", agent.Name())
+	fmt.Printf("Samples: %d | Invalid Actions: %d\n", len(latencies), invalid)
+	fmt.Printf("Mean: %s\n", (total / time.Duration(len(latencies))).Round(time.Microsecond))
+	fmt.Printf("P50:  %s\n", percentileDuration(latencies, 0.50).Round(time.Microsecond))
+	fmt.Printf("P95:  %s\n", percentileDuration(latencies, 0.95).Round(time.Microsecond))
+	fmt.Printf("P99:  %s\n", percentileDuration(latencies, 0.99).Round(time.Microsecond))
+	return nil
+}
+
+func runEvalEloCommand(inDir string, engineA string, modelAPath string, engineB string, modelBPath string, matches int, maxTurns int, beliefSamples int, depth int, moveBudget time.Duration) error {
+	if matches <= 0 {
+		matches = 100
+	}
+	states, err := collectDecisionStates(inDir, max(128, matches*2))
+	if err != nil {
+		return err
+	}
+
+	agentA, cleanupA, err := buildArenaAgent(engineA, modelAPath, beliefSamples, depth, moveBudget)
+	if err != nil {
+		return err
+	}
+	defer cleanupA()
+	agentB, cleanupB, err := buildArenaAgent(engineB, modelBPath, beliefSamples, depth, moveBudget)
+	if err != nil {
+		return err
+	}
+	defer cleanupB()
+
+	rng := rand.New(rand.NewSource(1))
+	eloA, eloB := 1500.0, 1500.0
+	k := 24.0
+	winsA, winsB, draws := 0, 0, 0
+
+	for i := 0; i < matches; i++ {
+		start := states[rng.Intn(len(states))]
+
+		res1 := arena.PlayFromState(start, agentA, agentB, arena.Config{MaxTurns: maxTurns})
+		scoreA1 := scoreAsP1(res1.Winner)
+		eloA, eloB = updateElo(eloA, eloB, scoreA1, k)
+		switch scoreA1 {
+		case 1:
+			winsA++
+		case 0:
+			winsB++
+		default:
+			draws++
+		}
+
+		res2 := arena.PlayFromState(start, agentB, agentA, arena.Config{MaxTurns: maxTurns})
+		scoreA2 := scoreAsP2(res2.Winner)
+		eloA, eloB = updateElo(eloA, eloB, scoreA2, k)
+		switch scoreA2 {
+		case 1:
+			winsA++
+		case 0:
+			winsB++
+		default:
+			draws++
+		}
+	}
+
+	totalGames := matches * 2
+	fmt.Printf("Elo Arena (%s vs %s)\n", agentA.Name(), agentB.Name())
+	fmt.Printf("Games: %d | A Wins: %d | B Wins: %d | Draws: %d\n", totalGames, winsA, winsB, draws)
+	fmt.Printf("Final Elo: %s = %.1f, %s = %.1f (delta %.1f)\n", agentA.Name(), eloA, agentB.Name(), eloB, eloA-eloB)
+	return nil
+}
+
+type selfPlayRecord struct {
+	Match    int     `json:"match"`
+	Ply      int     `json:"ply"`
+	Turn     int     `json:"turn"`
+	P1Engine string  `json:"p1Engine"`
+	P2Engine string  `json:"p2Engine"`
+	P1Action int     `json:"p1Action"`
+	P2Action int     `json:"p2Action"`
+	Value    float64 `json:"value"`
+	Winner   string  `json:"winner"`
+}
+
+func runSelfPlayGenerateCommand(inDir string, engineA string, modelAPath string, engineB string, modelBPath string, matches int, maxTurns int, beliefSamples int, depth int, moveBudget time.Duration, outPath string) error {
+	if matches <= 0 {
+		matches = 100
+	}
+	states, err := collectDecisionStates(inDir, max(128, matches))
+	if err != nil {
+		return err
+	}
+
+	agentA, cleanupA, err := buildArenaAgent(engineA, modelAPath, beliefSamples, depth, moveBudget)
+	if err != nil {
+		return err
+	}
+	defer cleanupA()
+	agentB, cleanupB, err := buildArenaAgent(engineB, modelBPath, beliefSamples, depth, moveBudget)
+	if err != nil {
+		return err
+	}
+	defer cleanupB()
+
+	if err := os.MkdirAll(path.Dir(outPath), 0755); err != nil {
+		return fmt.Errorf("failed to create output dir: %w", err)
+	}
+	file, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+
+	enc := json.NewEncoder(file)
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < matches; i++ {
+		start := states[rng.Intn(len(states))]
+		result := arena.PlayFromState(start, agentA, agentB, arena.Config{MaxTurns: maxTurns})
+		for ply, step := range result.Trace {
+			record := selfPlayRecord{
+				Match:    i + 1,
+				Ply:      ply + 1,
+				Turn:     step.Turn,
+				P1Engine: agentA.Name(),
+				P2Engine: agentB.Name(),
+				P1Action: step.P1Action,
+				P2Action: step.P2Action,
+				Value:    step.Value,
+				Winner:   result.Winner,
+			}
+			if err := enc.Encode(record); err != nil {
+				return fmt.Errorf("failed to encode self-play record: %w", err)
+			}
+		}
+	}
+
+	fmt.Printf("Wrote %d self-play matches to %s\n", matches, outPath)
+	return nil
+}
+
+func runExportONNXCommand(modelPath string, outPath string) error {
+	if modelPath == "" {
+		return fmt.Errorf("model path is required")
+	}
+	if !strings.HasSuffix(strings.ToLower(modelPath), ".json") {
+		return fmt.Errorf("expected Deep CFR JSON model for export, got %s", modelPath)
+	}
+	if _, err := os.Stat(modelPath); err != nil {
+		return fmt.Errorf("failed to read model file %s: %w", modelPath, err)
+	}
+	if err := os.MkdirAll(path.Dir(outPath), 0755); err != nil {
+		return fmt.Errorf("failed to create output dir: %w", err)
+	}
+
+	scriptPath := "tools/export_deepcfr_to_onnx.py"
+	if _, err := os.Stat(scriptPath); err != nil {
+		return fmt.Errorf("missing exporter script %s", scriptPath)
+	}
+	cmd := exec.Command("python3", scriptPath, "--in", modelPath, "--out", outPath)
+	output, err := cmd.CombinedOutput()
+	if len(output) > 0 {
+		fmt.Print(string(output))
+	}
+	if err != nil {
+		return fmt.Errorf("python exporter failed: %w", err)
+	}
+	fmt.Printf("Exported ONNX model to %s\n", outPath)
+	return nil
+}
+
+func percentileDuration(samples []time.Duration, p float64) time.Duration {
+	if len(samples) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return samples[0]
+	}
+	if p >= 1 {
+		return samples[len(samples)-1]
+	}
+	idx := int(math.Ceil(float64(len(samples))*p)) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(samples) {
+		idx = len(samples) - 1
+	}
+	return samples[idx]
+}
+
+func scoreAsP1(winner string) float64 {
+	switch winner {
+	case "p1":
+		return 1
+	case "p2":
+		return 0
+	default:
+		return 0.5
+	}
+}
+
+func scoreAsP2(winner string) float64 {
+	switch winner {
+	case "p2":
+		return 1
+	case "p1":
+		return 0
+	default:
+		return 0.5
+	}
+}
+
+func updateElo(eloA float64, eloB float64, scoreA float64, k float64) (float64, float64) {
+	expectA := 1.0 / (1.0 + math.Pow(10, (eloB-eloA)/400.0))
+	expectB := 1.0 - expectA
+	scoreB := 1.0 - scoreA
+	return eloA + k*(scoreA-expectA), eloB + k*(scoreB-expectB)
+}
+
+func minDuration(a time.Duration, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func runImportCommand(rawURL string) error {
