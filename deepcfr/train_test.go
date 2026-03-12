@@ -71,7 +71,7 @@ func TestCountReplayLogs(t *testing.T) {
 
 func TestNewExampleTrainerCPU(t *testing.T) {
 	model := NewModel(1)
-	trainer, err := newExampleTrainer(model, TrainingHyperParams{LearningRate: 0.001}, TrainConfig{
+	trainer, _, err := newExampleTrainer(model, TrainingHyperParams{LearningRate: 0.001}, TrainConfig{
 		Accelerator: "cpu",
 	})
 	if err != nil {

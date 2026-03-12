@@ -17,7 +17,7 @@ type cpuTrainer struct {
 	hp    TrainingHyperParams
 }
 
-func newExampleTrainer(model *Model, hp TrainingHyperParams, cfg TrainConfig) (exampleTrainer, error) {
+func newExampleTrainer(model *Model, hp TrainingHyperParams, cfg TrainConfig) (exampleTrainer, string, error) {
 	accelerator := strings.ToLower(strings.TrimSpace(cfg.Accelerator))
 	if accelerator == "" {
 		accelerator = "auto"
@@ -35,15 +35,16 @@ func newExampleTrainer(model *Model, hp TrainingHyperParams, cfg TrainConfig) (e
 	case "auto":
 		trainer, err := newOpenCLTrainer(model, hp, batchSize, cfg.OpenCLPlatform, cfg.OpenCLDevice)
 		if err == nil {
-			return trainer, nil
+			return trainer, "", nil
 		}
-		return &cpuTrainer{model: model, hp: hp}, nil
+		return &cpuTrainer{model: model, hp: hp}, fmt.Sprintf("train accelerator auto fallback to cpu: %v", err), nil
 	case "opencl":
-		return newOpenCLTrainer(model, hp, batchSize, cfg.OpenCLPlatform, cfg.OpenCLDevice)
+		trainer, err := newOpenCLTrainer(model, hp, batchSize, cfg.OpenCLPlatform, cfg.OpenCLDevice)
+		return trainer, "", err
 	case "cpu":
-		return &cpuTrainer{model: model, hp: hp}, nil
+		return &cpuTrainer{model: model, hp: hp}, "", nil
 	default:
-		return nil, fmt.Errorf("unknown training accelerator %q", cfg.Accelerator)
+		return nil, "", fmt.Errorf("unknown training accelerator %q", cfg.Accelerator)
 	}
 }
 

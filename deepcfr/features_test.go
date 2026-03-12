@@ -35,8 +35,16 @@ func TestEncodeStateSizeAndMask(t *testing.T) {
 
 	mask := buildLegalMask(state)
 	features := encodeState(state, mask)
+	mask32 := make([]float32, len(mask))
+	for i := range mask {
+		mask32[i] = float32(mask[i])
+	}
+	features32 := encodeState32(state, mask32)
 	if len(features) != FeatureSize {
 		t.Fatalf("expected feature size %d, got %d", FeatureSize, len(features))
+	}
+	if len(features32) != FeatureSize {
+		t.Fatalf("expected float32 feature size %d, got %d", FeatureSize, len(features32))
 	}
 	if mask[simulator.ActionMove1] != 1 || mask[simulator.ActionMove2] != 1 {
 		t.Fatalf("expected first two move actions to be legal, got %v", mask[:4])

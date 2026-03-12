@@ -44,28 +44,34 @@ Windows binary usage follows the same flags, for example:
 - `evaluate`: Evaluate a replay position at a turn.
 - `bulk-evaluate`: Evaluate many replay positions.
 - `search-evaluate`: Run search-based bulk evaluation.
-- `train-deepcfr`: Train the Deep CFR style model from replay logs.
-  - For OpenCL runs, increase `-train-batch-size` (default `512`) to improve GPU occupancy.
-  - Target generation is simulator-heavy and CPU-bound; tune `-target-workers` if CPU usage is too high.
 - `train-neuralv2`: Bootstrap neuralv2 training through the non-CUDA Deep CFR trainer path.
-- `deep-evaluate`: Evaluate a replay decision state with the Deep CFR engine.
 - `neural-evaluate`: Evaluate a replay decision state with the neuralv2 engine.
 - `eval-latency`: Benchmark per-decision latency on replay decision states.
 - `eval-elo`: Run a head-to-head Elo arena between two engines.
 - `selfplay-generate`: Generate JSONL self-play traces between two engines.
 - `export-onnx`: Export a Deep CFR JSON checkpoint to ONNX using `tools/export_deepcfr_to_onnx.py`.
 - `import`: Download + parse a single replay URL/ID.
-- `live`: Run the bot on Pokemon Showdown with `-engine mcts`, `-engine deepcfr`, or `-engine neuralv2`.
+- `live`: Run the bot on Pokemon Showdown with `-engine mcts` or `-engine neuralv2`.
 
 ## Build
 
 - Local build: `make build-local`
+- Local OpenCL build: `make build-local-opencl`
 - Tests: `make test`
 - Windows build: `make windows` (or `make build`, alias)
   - Single Windows target builds with OpenCL enabled (`-tags opencl`) and is compatible with OpenCL drivers (including ROCm OpenCL stacks).
   - Uses self-contained linker flags for MinGW runtime libraries (`-static-libgcc`, `-static-libstdc++`).
   - OpenCL itself remains provided by the installed driver runtime (e.g. `OpenCL.dll` via vendor ICD/ROCm).
   - Requires cross OpenCL headers/libs discoverable via `x86_64-w64-mingw32-pkg-config`.
+
+## Training Performance Flags
+
+`train-neuralv2` supports GPU-oriented target-generation and profiling controls:
+- `-target-predictor auto|cpu|opencl`
+- `-target-batch-size <N>`
+- `-target-queue-size <N>`
+- `-snapshot-files-per-sync <N>`
+- `-train-profile-json <path>`
 
 ## ONNX Export
 

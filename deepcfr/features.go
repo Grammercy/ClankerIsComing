@@ -90,6 +90,19 @@ func encodeState(state *simulator.BattleState, legalMask []float64) []float64 {
 	return features
 }
 
+func encodeState32(state *simulator.BattleState, legalMask []float32) []float32 {
+	mask64 := make([]float64, len(legalMask))
+	for i := range legalMask {
+		mask64[i] = float64(legalMask[i])
+	}
+	features64 := encodeState(state, mask64)
+	features32 := make([]float32, len(features64))
+	for i := range features64 {
+		features32[i] = float32(features64[i])
+	}
+	return features32
+}
+
 func buildLegalMask(state *simulator.BattleState) []float64 {
 	mask := make([]float64, simulator.MaxActions)
 	if state == nil {

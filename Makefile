@@ -9,12 +9,13 @@ GO_BUILD_FLAGS ?= -trimpath -buildvcs=false
 GO_LDFLAGS ?= -s -w
 WINDOWS_LDFLAGS ?= -s -w -linkmode external -extldflags '-static-libgcc -static-libstdc++'
 
-.PHONY: help build build-local test check-cross-toolchain check-cross-opencl windows
+.PHONY: help build build-local build-local-opencl test check-cross-toolchain check-cross-opencl windows
 
 help:
 	@echo "Targets:"
 	@echo "  make build       Alias for make windows"
 	@echo "  make build-local Build local binary"
+	@echo "  make build-local-opencl Build local binary with OpenCL tags"
 	@echo "  make test         Run all tests"
 	@echo "  make windows      Build Windows binary (single target: self-contained + OpenCL/ROCm-compatible)"
 	@echo ""
@@ -30,6 +31,9 @@ build:
 
 build-local:
 	go build -o $(APP) $(PKG)
+
+build-local-opencl:
+	CGO_ENABLED=1 go build -tags "opencl" -o $(APP) $(PKG)
 
 test:
 	go test ./...
