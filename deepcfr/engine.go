@@ -24,18 +24,29 @@ type SearchResult struct {
 }
 
 type Engine struct {
-	Model *Model
-	rng   *rand.Rand
+	Model     *Model
+	predictor statePredictor
+	rng       *rand.Rand
 }
 
 func NewEngine(model *Model, seed int64) *Engine {
 	if seed == 0 {
 		seed = 1
 	}
+	predictor := &directModelPredictor{model: model}
 	return &Engine{
-		Model: model,
-		rng:   rand.New(rand.NewSource(seed)),
+		Model:     model,
+		predictor: predictor,
+		rng:       rand.New(rand.NewSource(seed)),
 	}
+}
+
+func NewEngineWithPredictor(model *Model, predictor statePredictor, seed int64) *Engine {
+	engine := NewEngine(model, seed)
+	if predictor != nil {
+		engine.predictor = predictor
+	}
+	return engine
 }
 
 func (e *Engine) Evaluate(state *simulator.BattleState, cfg SearchConfig) SearchResult {
@@ -70,7 +81,7 @@ func (e *Engine) Evaluate(state *simulator.BattleState, cfg SearchConfig) Search
 	}
 
 	mask := buildLegalMask(state)
-	_, policy, _ := e.Model.Predict(encodeState(state, mask), mask)
+	_, policy, _ := e.predictor.Predict(encodeState(state, mask), mask)
 	actionValues := make(map[int]float64, n)
 	actionPolicy := make(map[int]float64, n)
 
@@ -125,7 +136,7 @@ func (e *Engine) actionValue(state *simulator.BattleState, ourAction int, depth 
 
 	swapped := swapPerspective(state)
 	oppMask := buildLegalMask(swapped)
-	_, oppPolicy, _ := e.Model.Predict(encodeState(swapped, oppMask), oppMask)
+	_, oppPolicy, _ := e.predictor.Predict(encodeState(swapped, oppMask), oppMask)
 
 	type weightedAction struct {
 		action int
@@ -178,7 +189,7 @@ func (e *Engine) counterfactualValue(state *simulator.BattleState, depth int) fl
 	best := math.Inf(-1)
 	limit := min(n, 3)
 	mask := buildLegalMask(state)
-	regrets, policy, _ := e.Model.Predict(encodeState(state, mask), mask)
+	regrets, policy, _ := e.predictor.Predict(encodeState(state, mask), mask)
 
 	type ranked struct {
 		action int
@@ -214,7 +225,7 @@ func (e *Engine) leafValue(state *simulator.BattleState) float64 {
 		return base
 	}
 	mask := buildLegalMask(state)
-	_, _, value := e.Model.Predict(encodeState(state, mask), mask)
+	_, _, value := e.predictor.Predict(encodeState(state, mask), mask)
 	return clamp01((base + value) / 2.0)
 }
 

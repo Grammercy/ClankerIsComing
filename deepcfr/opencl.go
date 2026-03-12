@@ -1165,6 +1165,125 @@ func (t *openCLTrainer) reluBackward(gradient C.cl_mem, activations C.cl_mem, to
 	return nil
 }
 
+type openCLBatchPredictBackend struct {
+	trainer       *openCLTrainer
+	weightsLoaded bool
+}
+
+func newOpenCLBatchPredictBackend(model *Model, platformHint string, deviceHint string, batchSize int) (batchPredictBackend, error) {
+	baseTrainer, err := newOpenCLTrainer(model, TrainingHyperParams{LearningRate: 0.0005, RegretWeight: 1, StrategyWeight: 1, ValueWeight: 0.5}, batchSize, platformHint, deviceHint)
+	if err != nil {
+		return nil, err
+	}
+	trainer, ok := baseTrainer.(*openCLTrainer)
+	if !ok {
+		_ = baseTrainer.Close()
+		return nil, fmt.Errorf("unexpected opencl trainer type %T", baseTrainer)
+	}
+	return &openCLBatchPredictBackend{trainer: trainer}, nil
+}
+
+func (b *openCLBatchPredictBackend) Name() string {
+	if b == nil || b.trainer == nil {
+		return "opencl-predictor"
+	}
+	return "opencl-predictor:" + b.trainer.Name()
+}
+
+func (b *openCLBatchPredictBackend) Close() error {
+	if b == nil || b.trainer == nil {
+		return nil
+	}
+	return b.trainer.Close()
+}
+
+func (b *openCLBatchPredictBackend) PredictBatch(features []float32, legalMasks []float32, batch int, outRegret []float32, outPolicy []float32, outValue []float32) error {
+	if b == nil || b.trainer == nil {
+		return errors.New("opencl predictor is not initialized")
+	}
+	t := b.trainer
+	if batch < 0 || batch > t.batchSize {
+		return fmt.Errorf("predict batch size %d exceeds backend capacity %d", batch, t.batchSize)
+	}
+	if batch == 0 {
+		return nil
+	}
+
+	clear(t.host.x)
+	clear(t.host.legalMask)
+	copy(t.host.x[:batch*FeatureSize], features[:batch*FeatureSize])
+	copy(t.host.legalMask[:batch*simulator.MaxActions], legalMasks[:batch*simulator.MaxActions])
+
+	if err := t.writeFloat32(t.buffers.x, t.host.x[:batch*FeatureSize]); err != nil {
+		return err
+	}
+	if err := b.ensureWeightsLoaded(); err != nil {
+		return err
+	}
+
+	if err := t.runForward(batch); err != nil {
+		return err
+	}
+
+	strategy := make([]float32, simulator.MaxActions)
+	for row := 0; row < batch; row++ {
+		actionOffset := row * simulator.MaxActions
+		logits := t.host.strategyLogits[actionOffset : actionOffset+simulator.MaxActions]
+		mask := t.host.legalMask[actionOffset : actionOffset+simulator.MaxActions]
+		maskedSoftmax32(logits, mask, strategy)
+		copy(outRegret[actionOffset:actionOffset+simulator.MaxActions], t.host.regret[actionOffset:actionOffset+simulator.MaxActions])
+		copy(outPolicy[actionOffset:actionOffset+simulator.MaxActions], strategy)
+		outValue[row] = float32(sigmoid(float64(t.host.valueLogits[row] + float32(t.model.BValue))))
+	}
+	return nil
+}
+
+func (b *openCLBatchPredictBackend) ensureWeightsLoaded() error {
+	if b.weightsLoaded {
+		return nil
+	}
+	t := b.trainer
+	copyFloat64SliceTo32(t.host.w1, t.model.W1)
+	copyFloat64SliceTo32(t.host.b1, t.model.B1)
+	copyFloat64SliceTo32(t.host.w2, t.model.W2)
+	copyFloat64SliceTo32(t.host.b2, t.model.B2)
+	copyFloat64SliceTo32(t.host.wRegret, t.model.WRegret)
+	copyFloat64SliceTo32(t.host.bRegret, t.model.BRegret)
+	copyFloat64SliceTo32(t.host.wStrategy, t.model.WStrategy)
+	copyFloat64SliceTo32(t.host.bStrategy, t.model.BStrategy)
+	copyFloat64SliceTo32(t.host.wValue, t.model.WValue)
+
+	if err := t.writeFloat32(t.buffers.w1, t.host.w1); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.b1, t.host.b1); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.w2, t.host.w2); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.b2, t.host.b2); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.wRegret, t.host.wRegret); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.bRegret, t.host.bRegret); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.wStrategy, t.host.wStrategy); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.bStrategy, t.host.bStrategy); err != nil {
+		return err
+	}
+	if err := t.writeFloat32(t.buffers.wValue, t.host.wValue); err != nil {
+		return err
+	}
+	b.weightsLoaded = true
+	return nil
+}
+
 func copyFloat64SliceTo32(dst []float32, src []float64) {
 	for i := range src {
 		dst[i] = float32(src[i])

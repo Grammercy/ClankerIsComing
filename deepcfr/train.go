@@ -1,6 +1,7 @@
 package deepcfr
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -17,25 +18,30 @@ import (
 )
 
 type TrainConfig struct {
-	ReplayDir         string
-	ModelPath         string
-	Epochs            int
-	MaxFiles          int
-	Seed              int64
-	BeliefSamples     int
-	OpponentSamples   int
-	TargetDepth       int
-	LearningRate      float64
-	ReplayPolicyBlend float64
-	ChosenActionBonus float64
-	ProgressWriter    io.Writer
-	ProgressInterval  time.Duration
-	Accelerator       string
-	BatchSize         int
-	OpenCLPlatform    string
-	OpenCLDevice      string
-	TargetWorkers     int
-	StopChan          <-chan struct{}
+	ReplayDir            string
+	ModelPath            string
+	Epochs               int
+	MaxFiles             int
+	Seed                 int64
+	BeliefSamples        int
+	OpponentSamples      int
+	TargetDepth          int
+	LearningRate         float64
+	ReplayPolicyBlend    float64
+	ChosenActionBonus    float64
+	ProgressWriter       io.Writer
+	ProgressInterval     time.Duration
+	Accelerator          string
+	BatchSize            int
+	OpenCLPlatform       string
+	OpenCLDevice         string
+	TargetWorkers        int
+	TargetPredictor      string
+	TargetBatchSize      int
+	TargetQueueSize      int
+	SnapshotFilesPerSync int
+	TrainProfilePath     string
+	StopChan             <-chan struct{}
 }
 
 type TrainStats struct {
@@ -52,6 +58,22 @@ type replayPosition struct {
 	State        simulator.BattleState
 	ChosenAction int
 	Outcome      float64
+}
+
+type trainProfile struct {
+	StartedAt        time.Time          `json:"startedAt"`
+	FinishedAt       time.Time          `json:"finishedAt"`
+	DurationSec      float64            `json:"durationSec"`
+	Positions        int                `json:"positions"`
+	FilesSeen        int                `json:"filesSeen"`
+	StagesSec        map[string]float64 `json:"stagesSec"`
+	StagesPct        map[string]float64 `json:"stagesPct"`
+	PosPerSec        float64            `json:"positionsPerSec"`
+	FilePerSec       float64            `json:"filesPerSec"`
+	PredictBatches   int64              `json:"predictBatches"`
+	PredictStates    int64              `json:"predictStates"`
+	PredictBatchSec  float64            `json:"predictBatchSec"`
+	PredictFallbacks int64              `json:"predictFallbacks"`
 }
 
 type trainingProgress struct {
@@ -307,6 +329,12 @@ func atomicLoadFloat64(src *atomic.Uint64) float64 {
 }
 
 func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
+	startedAt := time.Now()
+	stageDurations := map[string]time.Duration{}
+	addStage := func(name string, d time.Duration) {
+		stageDurations[name] += d
+	}
+
 	if cfg.Epochs <= 0 {
 		cfg.Epochs = 1
 	}
@@ -331,11 +359,23 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 	if cfg.TargetWorkers <= 0 {
 		cfg.TargetWorkers = max(1, runtime.GOMAXPROCS(0)-1)
 	}
+	if cfg.TargetBatchSize <= 0 {
+		cfg.TargetBatchSize = 2048
+	}
+	if cfg.TargetQueueSize <= 0 {
+		cfg.TargetQueueSize = 8192
+	}
+	if cfg.SnapshotFilesPerSync <= 0 {
+		cfg.SnapshotFilesPerSync = 16
+	}
 
 	if cfg.ProgressWriter != nil {
 		fmt.Fprintln(cfg.ProgressWriter, "stage: building replay priors")
 	}
+	resetPredictorMetrics()
+	priorsStart := time.Now()
 	priors, _, err := BuildPriorsFromReplayDirWithProgress(cfg.ReplayDir, cfg.MaxFiles, cfg.ProgressWriter, cfg.ProgressInterval)
+	addStage("build_priors", time.Since(priorsStart))
 	if err != nil {
 		return nil, TrainStats{}, err
 	}
@@ -357,7 +397,7 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 		StrategyWeight: 0.75,
 		ValueWeight:    0.5,
 	}
-	trainer, err := newExampleTrainer(model, hp, cfg)
+	trainer, trainerWarning, err := newExampleTrainer(model, hp, cfg)
 	if err != nil {
 		return nil, TrainStats{}, err
 	}
@@ -365,8 +405,13 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 	stats := TrainStats{Backend: trainer.Name()}
 	if progress != nil {
 		fmt.Fprintf(cfg.ProgressWriter, "training backend: %s\n", trainer.Name())
+		if trainerWarning != "" {
+			fmt.Fprintf(cfg.ProgressWriter, "warning: %s\n", trainerWarning)
+		}
 		progress.startLoop()
 		defer progress.finish()
+	} else if cfg.ProgressWriter != nil && trainerWarning != "" {
+		fmt.Fprintf(cfg.ProgressWriter, "warning: %s\n", trainerWarning)
 	}
 	recordMetrics := func(all []TrainingMetrics) {
 		for _, metrics := range all {
@@ -391,6 +436,60 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 		}
 	}
 	interrupted := false
+	writeProfile := func(stats TrainStats) error {
+		if strings.TrimSpace(cfg.TrainProfilePath) == "" {
+			return nil
+		}
+		now := time.Now()
+		total := now.Sub(startedAt)
+		if total <= 0 {
+			total = time.Nanosecond
+		}
+		predictMetrics := snapshotPredictorMetrics()
+		stages := make(map[string]float64, len(stageDurations))
+		stagePct := make(map[string]float64, len(stageDurations))
+		for name, d := range stageDurations {
+			stages[name] = d.Seconds()
+			stagePct[name] = (d.Seconds() / total.Seconds()) * 100.0
+		}
+		profile := trainProfile{
+			StartedAt:        startedAt,
+			FinishedAt:       now,
+			DurationSec:      total.Seconds(),
+			Positions:        stats.Positions,
+			FilesSeen:        stats.FilesSeen,
+			StagesSec:        stages,
+			StagesPct:        stagePct,
+			PosPerSec:        float64(stats.Positions) / total.Seconds(),
+			FilePerSec:       float64(stats.FilesSeen) / total.Seconds(),
+			PredictBatches:   predictMetrics.Batches,
+			PredictStates:    predictMetrics.States,
+			PredictBatchSec:  predictMetrics.Duration.Seconds(),
+			PredictFallbacks: predictMetrics.Fallbacks,
+		}
+		encoded, err := json.MarshalIndent(profile, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to encode train profile: %w", err)
+		}
+		if err := os.WriteFile(cfg.TrainProfilePath, encoded, 0644); err != nil {
+			return fmt.Errorf("failed to write train profile: %w", err)
+		}
+		return nil
+	}
+
+	var targetSnapshot *Model
+	var targetPredictor statePredictor
+	filesSinceSnapshot := 0
+	var predictorWarningPrinted bool
+	closeTargetPredictor := func() {
+		if targetPredictor != nil {
+			_ = targetPredictor.Close()
+			targetPredictor = nil
+		}
+		targetSnapshot = nil
+		filesSinceSnapshot = 0
+	}
+	defer closeTargetPredictor()
 
 	for epoch := 0; epoch < cfg.Epochs; epoch++ {
 		filesSeen := 0
@@ -416,7 +515,9 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 				progress.recordAttempt()
 			}
 
+			parseStart := time.Now()
 			replay, err := parser.ParseLogFile(cfg.ReplayDir + "/" + entry.Name())
+			addStage("parse_replay", time.Since(parseStart))
 			if err != nil {
 				if progress != nil {
 					progress.recordParseError()
@@ -424,7 +525,9 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 				continue
 			}
 
+			extractStart := time.Now()
 			positions := extractReplayPositions(replay)
+			addStage("extract_positions", time.Since(extractStart))
 			if len(positions) == 0 {
 				filesSeen++
 				stats.FilesSeen++
@@ -434,7 +537,23 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 				continue
 			}
 
-			examples, err := prepareTrainingExamples(positions, model, cfg, epoch, filesSeen, cfg.Seed)
+			if targetSnapshot == nil || filesSinceSnapshot >= cfg.SnapshotFilesPerSync {
+				closeTargetPredictor()
+				targetSnapshot = model.Clone()
+				predictor, warning, err := newStatePredictor(targetSnapshot, cfg)
+				if err != nil {
+					return nil, stats, err
+				}
+				targetPredictor = predictor
+				if warning != "" && cfg.ProgressWriter != nil && !predictorWarningPrinted {
+					fmt.Fprintf(cfg.ProgressWriter, "warning: %s\n", warning)
+					predictorWarningPrinted = true
+				}
+			}
+
+			targetStart := time.Now()
+			examples, err := prepareTrainingExamples(positions, targetSnapshot, targetPredictor, cfg, epoch, filesSeen, cfg.Seed)
+			addStage("prepare_examples", time.Since(targetStart))
 			if err != nil {
 				return nil, stats, err
 			}
@@ -443,7 +562,9 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 					interrupted = true
 					break
 				}
+				trainStepStart := time.Now()
 				metrics, err := trainer.Train(example)
+				addStage("trainer_train", time.Since(trainStepStart))
 				if err != nil {
 					return nil, stats, err
 				}
@@ -452,13 +573,16 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 			if interrupted {
 				break
 			}
+			filesSinceSnapshot++
 			filesSeen++
 			stats.FilesSeen++
 			if progress != nil {
 				progress.recordFileComplete(false)
 			}
 		}
+		flushStart := time.Now()
 		metrics, err := trainer.Flush()
+		addStage("trainer_flush", time.Since(flushStart))
 		if err != nil {
 			return nil, stats, err
 		}
@@ -466,8 +590,11 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 		if interrupted {
 			break
 		}
+		closeTargetPredictor()
 	}
+	flushStart := time.Now()
 	metrics, err := trainer.Flush()
+	addStage("trainer_flush", time.Since(flushStart))
 	if err != nil {
 		return nil, stats, err
 	}
@@ -483,19 +610,27 @@ func TrainFromReplayDir(cfg TrainConfig) (*Model, TrainStats, error) {
 		stats.AveragePolicyCE /= float64(stats.Positions)
 	}
 	if cfg.ModelPath != "" {
+		saveStart := time.Now()
 		if err := model.Save(cfg.ModelPath); err != nil {
 			return nil, stats, err
 		}
+		addStage("save_model", time.Since(saveStart))
+	}
+	if err := writeProfile(stats); err != nil {
+		return nil, stats, err
 	}
 	return model, stats, nil
 }
 
-func prepareTrainingExamples(positions []replayPosition, model *Model, cfg TrainConfig, epoch int, fileIndex int, seed int64) ([]TrainingExample, error) {
+func prepareTrainingExamples(positions []replayPosition, model *Model, predictor statePredictor, cfg TrainConfig, epoch int, fileIndex int, seed int64) ([]TrainingExample, error) {
 	if len(positions) == 0 {
 		return nil, nil
 	}
+	if predictor == nil {
+		predictor = &directModelPredictor{model: model}
+	}
 	if cfg.TargetWorkers <= 1 || len(positions) == 1 {
-		engine := NewEngine(model, seed+17)
+		engine := NewEngineWithPredictor(model, predictor, seed+17)
 		rng := rand.New(rand.NewSource(seed))
 		examples := make([]TrainingExample, 0, len(positions))
 		for _, pos := range positions {
@@ -518,19 +653,26 @@ func prepareTrainingExamples(positions []replayPosition, model *Model, cfg Train
 		ok      bool
 	}
 
-	snapshot := model.Clone()
 	workerCount := min(cfg.TargetWorkers, len(positions))
-	tasks := make(chan task, workerCount)
+	queueCap := cfg.TargetQueueSize
+	if queueCap <= 0 {
+		queueCap = 8192
+	}
+	taskCap := min(queueCap, len(positions))
+	if taskCap <= 0 {
+		taskCap = workerCount
+	}
+	tasks := make(chan task, taskCap)
 	results := make(chan result, len(positions))
 
 	baseSeed := seed + int64(epoch)*1_000_003 + int64(fileIndex)*10_007
 	for worker := 0; worker < workerCount; worker++ {
 		workerSeed := baseSeed + int64(worker+1)*7919
 		go func(localSeed int64) {
-			engine := NewEngine(snapshot, localSeed+17)
+			engine := NewEngineWithPredictor(model, predictor, localSeed+17)
 			rng := rand.New(rand.NewSource(localSeed))
 			for job := range tasks {
-				example, ok := buildTrainingExample(job.pos, snapshot, engine, rng, cfg)
+				example, ok := buildTrainingExample(job.pos, model, engine, rng, cfg)
 				results <- result{index: job.index, example: example, ok: ok}
 			}
 		}(workerSeed)
@@ -600,7 +742,7 @@ func deriveTargets(engine *Engine, state *simulator.BattleState, chosenAction in
 		return regrets, strategy
 	}
 	mask := buildLegalMask(state)
-	_, predictedStrategy, _ := engine.Model.Predict(encodeState(state, mask), mask)
+	_, predictedStrategy, _ := engine.predictor.Predict(encodeState(state, mask), mask)
 
 	actionValues := make(map[int]float64, n)
 	baseline := 0.0

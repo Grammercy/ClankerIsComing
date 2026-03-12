@@ -12,7 +12,6 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/pokemon-engine/bot"
-	"github.com/pokemon-engine/deepcfr"
 	"github.com/pokemon-engine/gamedata"
 	"github.com/pokemon-engine/neuralv2"
 	"github.com/pokemon-engine/simulator"
@@ -31,7 +30,6 @@ type ShowdownBot struct {
 	battles     map[string]*BattleContext // roomID -> context
 	moveTime    time.Duration
 	engine      string
-	deepModel   *deepcfr.Model
 	neuralModel *neuralv2.Model
 }
 
@@ -44,15 +42,7 @@ func RunBot(username, password string, moveTime time.Duration, engineName string
 	if err := gamedata.LoadMovedex("data/moves.json"); err != nil {
 		log.Printf("Warning: Movedex not loaded: %v", err)
 	}
-	var model *deepcfr.Model
 	var neuralModel *neuralv2.Model
-	if engineName == "deepcfr" && modelPath != "" {
-		loaded, err := deepcfr.LoadModel(modelPath)
-		if err != nil {
-			return fmt.Errorf("failed to load Deep CFR model: %w", err)
-		}
-		model = loaded
-	}
 	if engineName == "neuralv2" && modelPath != "" {
 		loaded, err := neuralv2.LoadModel(neuralv2.LoadConfig{
 			Path: modelPath,
@@ -70,7 +60,6 @@ func RunBot(username, password string, moveTime time.Duration, engineName string
 		battles:     make(map[string]*BattleContext),
 		moveTime:    moveTime,
 		engine:      engineName,
-		deepModel:   model,
 		neuralModel: neuralModel,
 	}
 
@@ -724,7 +713,7 @@ func (b *ShowdownBot) onRequest(roomID, data string) {
 	ctx.State = state
 	DebugPrintState(roomID, state)
 
-	choice, actionIdx, searchResult := ChooseBestAction(&req, b.moveTime, ctx.State, b.engine, b.deepModel, b.neuralModel)
+	choice, actionIdx, searchResult := ChooseBestAction(&req, b.moveTime, ctx.State, b.engine, b.neuralModel)
 	if choice == "" {
 		return
 	}
@@ -785,7 +774,7 @@ func (b *ShowdownBot) onTeamPreview(roomID string) {
 	}
 
 	ctx.Request.TeamPreview = true
-	choice, _, _ := ChooseBestAction(ctx.Request, b.moveTime, ctx.State, b.engine, b.deepModel, b.neuralModel)
+	choice, _, _ := ChooseBestAction(ctx.Request, b.moveTime, ctx.State, b.engine, b.neuralModel)
 	cmd := fmt.Sprintf("/choose %s|%d", choice, ctx.Request.Rqid)
 	b.send(roomID, cmd)
 	log.Printf("[%s] Team Preview: %s", roomID, cmd)
